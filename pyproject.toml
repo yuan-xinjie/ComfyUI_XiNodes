@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ComfyUI_XiNodes"
+version = "1.0.0"
+description = "A custom node for ComfyUI to load and synchronize images from multiple folders for batch processing."
+authors = [
+  { name="yuan-xinjie" }
+]
+requires-python = ">=3.8"
+dependencies = [
+    "torch",
+    "numpy",
+    "Pillow"
+]
+
+[project.urls]
+"Homepage" = "https://github.com/yuan-xinjie/ComfyUI_XiNodes"
