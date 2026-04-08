@@ -106,8 +106,8 @@ class XiMultiFolderImageLoader:
             raise RuntimeError(f"XiNodes Loader Error: Failed to load image '{image_path}': {e}")
 
     def create_placeholder(self):
-        # 返回一个 64x64 的全黑占位张量
-        return torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+        # 根据需求：如果未提供文件夹或文件夹留空，不要黑底，直接留空传递 None 给下游节点
+        return None
 
 NODE_CLASS_MAPPINGS = {
     "XiMultiFolderImageLoader": XiMultiFolderImageLoader
