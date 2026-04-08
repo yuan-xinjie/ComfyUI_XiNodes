@@ -25,7 +25,7 @@ app.registerExtension({
                         if (count < 1) count = 1;
                         if (count > 10) count = 10;
                         
-                        // 1. 完全剔除隐去多余选项，通过映射我们当初的全缓存内存进行切段来重新装填到展示名单
+                        // 1. 完全剔除隐去多余选项，通过映射全缓存内存进行切段来重新装填到展示名单
                         this.widgets = this._full_widgets_cache.filter(w => {
                             if (w.name && w.name.startsWith("folder_")) {
                                 const num = parseInt(w.name.split("_")[1]);
@@ -65,7 +65,6 @@ app.registerExtension({
                         
                         if (this.computeSize) {
                              const size = this.computeSize();
-                             // 取用最大值保证如果不小心比必要尺寸小依然能撑开，但如果用户已经拉到极其宽的尺寸了，将全盘保留不做还原缩小！
                              this.size[0] = Math.max(this.size[0], size[0]);
                              this.size[1] = size[1];
                         }
@@ -80,7 +79,6 @@ app.registerExtension({
                 // 将最后执行的状态打上时间戳或值记忆
                 this._last_dyn_count = -1;
 
-                // 首次在构造完毕的滞后阶段做一次强梳理，这也是使得用户刚拿出来或刚刷新网页时只有1~3个端点的触发功臣。
                 setTimeout(() => {
                      const cntWidget = this.widgets.find(w => w.name === "folder_count");
                      if (cntWidget) {
@@ -92,8 +90,6 @@ app.registerExtension({
                 return result;
             }
             
-            // 【核武器级手段！无死角拦截】不采用任何极其脆弱的基于 callback 或钩子的事件订阅，因为在其他复杂插件介入后随时可能导致脱钩
-            // 取而代之我们使用引擎底层画图管线作为心跳发生器。只要用户拉动了进度条，它必然会调用 onDraw，此时对比出不同后便立即触发送往重构模块！
             const onDrawForeground = nodeType.prototype.onDrawForeground;
             nodeType.prototype.onDrawForeground = function (ctx) {
                 const result = onDrawForeground ? onDrawForeground.apply(this, arguments) : undefined;
