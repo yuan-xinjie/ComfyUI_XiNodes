@@ -248,6 +248,7 @@ class XiImageBatchCrossfade:
                 "transition_type": (["linear", "ease_in", "ease_out", "ease_in_out"], {"default": "linear"}),
                 "resize_behavior": (["resize_to_match_a", "resize_to_match_b", "error"], {"default": "resize_to_match_a"}),
                 "alpha_handling": (["keep_alpha_channels", "layer_on_black", "layer_on_white", "layer_on_green"], {"default": "keep_alpha_channels"}),
+                "frame_duration_behavior": (["freeze_ends", "reduce_frames"], {"default": "freeze_ends"}),
             }
         }
 
@@ -256,7 +257,7 @@ class XiImageBatchCrossfade:
     FUNCTION = "crossfade"
     CATEGORY = "XiNodes"
 
-    def crossfade(self, images_a, images_b, transition_frames, transition_type, resize_behavior, alpha_handling):
+    def crossfade(self, images_a, images_b, transition_frames, transition_type, resize_behavior, alpha_handling, frame_duration_behavior="freeze_ends"):
         # 1. 确保输入是 4D 张量 (B, H, W, C)
         if len(images_a.shape) == 3:
             images_a = images_a.unsqueeze(0)
@@ -333,15 +334,6 @@ class XiImageBatchCrossfade:
             out_images = torch.cat([images_a, images_b], dim=0)
             return (out_images,)
 
-        # 过渡帧之前的部分
-        images_a_part = images_a[:N_A - actual_transition]
-        # 过渡帧之后的部分
-        images_b_part = images_b[actual_transition:]
-
-        # 过渡期间的帧
-        fade_out = images_a[-actual_transition:]
-        fade_in = images_b[:actual_transition]
-
         # 权重系数 alphas
         if actual_transition == 1:
             alphas = torch.tensor([0.5], dtype=images_a.dtype, device=images_a.device)
@@ -356,19 +348,57 @@ class XiImageBatchCrossfade:
         elif transition_type == "ease_in_out":
             alphas = alphas ** 2 * (3.0 - 2.0 * alphas)
 
-        # 形状对齐为 (actual_transition, 1, 1, 1)
         alphas = alphas.view(actual_transition, 1, 1, 1)
 
-        # 线性插值混合
-        transition_part = (1.0 - alphas) * fade_out + alphas * fade_in
-
-        # 拼接最终的图像批次
         parts = []
-        if images_a_part.shape[0] > 0:
-            parts.append(images_a_part)
-        parts.append(transition_part)
-        if images_b_part.shape[0] > 0:
-            parts.append(images_b_part)
+        if frame_duration_behavior == "reduce_frames":
+            # reduce_frames (原重叠模式，总帧数减少 actual_transition)
+            images_a_part = images_a[:N_A - actual_transition]
+            images_b_part = images_b[actual_transition:]
+            fade_out = images_a[-actual_transition:]
+            fade_in = images_b[:actual_transition]
+            transition_part = (1.0 - alphas) * fade_out + alphas * fade_in
+
+            if images_a_part.shape[0] > 0:
+                parts.append(images_a_part)
+            parts.append(transition_part)
+            if images_b_part.shape[0] > 0:
+                parts.append(images_b_part)
+
+        else:
+            # 默认为 freeze_ends (冻结 A 的尾部 n_freeze_a 帧与 B 的首部 n_freeze_b 帧，总帧数保持 N_A + N_B)
+            # 这样做可以完美向后兼容旧版工作流或缓存缺失该参数导致传参为 None 的情况
+            n_freeze_a = (actual_transition + 1) // 2
+            n_freeze_b = actual_transition // 2
+
+            # 构造 fade_out (长度为 actual_transition)
+            # 前半段为 A 的最后 n_freeze_a 帧，后半段为 A 的最后一帧重复 n_freeze_b 次
+            fade_out_list = [images_a[-n_freeze_a:]]
+            if n_freeze_b > 0:
+                fade_out_list.append(images_a[-1:].repeat(n_freeze_b, 1, 1, 1))
+            fade_out = torch.cat(fade_out_list, dim=0)
+
+            # 构造 fade_in (长度为 actual_transition)
+            # 前半段为 B 的首帧重复 n_freeze_a 次，后半段为 B 的前 n_freeze_b 帧
+            fade_in_list = []
+            if n_freeze_a > 0:
+                fade_in_list.append(images_b[0:1].repeat(n_freeze_a, 1, 1, 1))
+            if n_freeze_b > 0:
+                fade_in_list.append(images_b[:n_freeze_b])
+            fade_in = torch.cat(fade_in_list, dim=0)
+
+            # 叠化过渡段
+            transition_part = (1.0 - alphas) * fade_out + alphas * fade_in
+
+            # 拼接非混合部分
+            images_a_part = images_a[:-n_freeze_a]
+            images_b_part = images_b[n_freeze_b:]
+
+            if images_a_part.shape[0] > 0:
+                parts.append(images_a_part)
+            parts.append(transition_part)
+            if images_b_part.shape[0] > 0:
+                parts.append(images_b_part)
 
         out_images = torch.cat(parts, dim=0)
         return (out_images,)
