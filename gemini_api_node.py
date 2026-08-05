@@ -10,10 +10,6 @@ from google import genai
 from google.genai import types
 
 def tensor_to_pil(tensor_img, max_dim=1536):
-    """
-    将 ComfyUI IMAGE Tensor 转为压缩后的 PIL Image 对象，
-    限制最大长边像素 (默认 1536px)，防止转 Base64 提交时触发中转 Nginx 413 Request Entity Too Large 报错。
-    """
     if len(tensor_img.shape) == 4:
         tensor_img = tensor_img[0]
     array = (tensor_img.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
@@ -32,26 +28,19 @@ def tensor_to_pil(tensor_img, max_dim=1536):
     buf.seek(0)
     return Image.open(buf)
 
+def pil_to_part(pil_img):
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=85)
+    return types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg")
+
 def detect_closest_aspect_ratio(pil_img):
-    """自动检测输入 PIL 图片的精准高宽比，映射为 Gemini 标准比例字符串"""
     w, h = pil_img.size
     ratio = w / float(h)
-    
     known_ratios = {
-        "1:1": 1.0,
-        "3:4": 3/4,
-        "4:3": 4/3,
-        "9:16": 9/16,
-        "16:9": 16/9,
-        "2:3": 2/3,
-        "3:2": 3/2,
-        "4:5": 4/5,
-        "5:4": 5/4,
-        "21:9": 21/9
+        "1:1": 1.0, "3:4": 3/4, "4:3": 4/3, "9:16": 9/16, "16:9": 16/9,
+        "2:3": 2/3, "3:2": 3/2, "4:5": 4/5, "5:4": 5/4, "21:9": 21/9
     }
-    
-    closest_name = min(known_ratios.keys(), key=lambda k: abs(known_ratios[k] - ratio))
-    return closest_name
+    return min(known_ratios.keys(), key=lambda k: abs(known_ratios[k] - ratio))
 
 def clean_text_media_references(text):
     if not text:
@@ -68,7 +57,70 @@ def clean_text_media_references(text):
 
 
 # ==========================================
-# Google GenAI 官方 SDK (google-genai) 驱动节点
+# 上下文记忆历史缓存 (最大 512KB，不保存图片 Base64)
+# ==========================================
+GLOBAL_CONTEXT_MEMORY = {}
+MAX_CONTEXT_BYTES = 512 * 1024  # 512 KB (524288 字节)
+
+def get_context_history(session_id):
+    if session_id not in GLOBAL_CONTEXT_MEMORY:
+        GLOBAL_CONTEXT_MEMORY[session_id] = []
+    return GLOBAL_CONTEXT_MEMORY[session_id]
+
+def clear_context_history(session_id=None):
+    global GLOBAL_CONTEXT_MEMORY
+    if session_id:
+        GLOBAL_CONTEXT_MEMORY.pop(session_id, None)
+    else:
+        GLOBAL_CONTEXT_MEMORY.clear()
+
+def sanitize_and_trim_history(history_list):
+    """
+    1. 彻底过滤并移除 Content 对象中的图片/二进制数据，仅保留纯文本。
+    2. 计算总体字节数，若超过 512KB，则自动从最早的历史轮次开始自动裁剪/压缩，直到 <= 512KB。
+    """
+    clean_history = []
+    for item in history_list:
+        if not isinstance(item, types.Content):
+            continue
+        
+        clean_parts = []
+        if item.parts:
+            for p in item.parts:
+                # 只保留包含文本的 Part，丢弃所有 inline_data / bytes 图片
+                if hasattr(p, 'text') and p.text and str(p.text).strip():
+                    clean_parts.append(types.Part.from_text(text=str(p.text).strip()))
+        
+        # 若该轮仅生成了图片而无文本，记录简洁轻量的占位说明
+        if not clean_parts:
+            if item.role == "model":
+                clean_parts.append(types.Part.from_text(text="[Generated image successfully]"))
+            else:
+                clean_parts.append(types.Part.from_text(text="[Provided reference image]"))
+
+        clean_history.append(types.Content(role=item.role, parts=clean_parts))
+
+    # 计算全局字节数并自动滑动裁剪压缩
+    def calc_bytes(cnts):
+        total = 0
+        for c in cnts:
+            for p in c.parts:
+                if p.text:
+                    total += len(p.text.encode('utf-8'))
+        return total
+
+    while clean_history and calc_bytes(clean_history) > MAX_CONTEXT_BYTES:
+        # 一次剔除最早的一对 user + model 消息
+        if len(clean_history) >= 2:
+            clean_history = clean_history[2:]
+        else:
+            clean_history.pop(0)
+
+    return clean_history
+
+
+# ==========================================
+# Google GenAI 官方 SDK 驱动节点 (Gemini API Node)
 # ==========================================
 class XiGeminiNode:
     def __init__(self):
@@ -85,6 +137,8 @@ class XiGeminiNode:
                 "user_prompt": ("STRING", {"default": "", "multiline": True}),
                 "aspect_ratio": (["Auto", "1:1", "3:4", "4:3", "9:16", "16:9", "2:3", "3:2", "4:5", "5:4", "21:9"], {"default": "Auto"}),
                 "resolution": (["Auto", "512", "1K", "2K", "4K"], {"default": "1K"}),
+                "context_memory": (["enable", "disable"], {"default": "enable"}),
+                "clear_history": ("BOOLEAN", {"default": False}),
                 "multi_image_mode": (["process_separately", "combine_in_one_prompt"], {"default": "process_separately"}),
                 "temperature": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
                 "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
@@ -103,9 +157,15 @@ class XiGeminiNode:
     OUTPUT_NODE = True
     CATEGORY = "XiNodes"
 
-    def request_gemini(self, base_url, api_key, model, system_prompt, user_prompt, aspect_ratio, resolution, multi_image_mode, temperature, seed, timeout, **kwargs):
-        client_options = {}
+    def request_gemini(self, base_url, api_key, model, system_prompt, user_prompt, aspect_ratio, resolution, context_memory, clear_history, multi_image_mode, temperature, seed, timeout, **kwargs):
+        # 1. 历史记忆控制
+        session_id = f"{model.strip()}_{base_url.strip()}"
+        if clear_history:
+            clear_context_history(session_id)
+            print(f"[XiNodes Gemini Memory] Context history cleared for session '{session_id}'.")
 
+        # 2. 配置 client
+        client_options = {}
         clean_base_url = base_url.strip().rstrip("/") if base_url else ""
         if clean_base_url:
             if not clean_base_url.endswith("/v1beta") and not clean_base_url.endswith("/v1"):
@@ -120,7 +180,7 @@ class XiGeminiNode:
         client = genai.Client(**client_options)
         model_name = model.strip() if model and model.strip() else "gemini-3.1-flash-image"
 
-        # 1. 收集所有传入的独立 PIL 图片列表
+        # 3. 收集输入图片
         input_pil_images = []
         for i in range(1, 4):
             img_input = kwargs.get(f"image_{i}")
@@ -134,11 +194,11 @@ class XiGeminiNode:
                     pil_img = tensor_to_pil(img_input)
                     input_pil_images.append(pil_img)
 
-        # 2. 单请求执行函数帮助类
+        # 4. 单请求执行核心帮助函数
         def _call_single_generate(input_images_group, effective_aspect_ratio):
-            contents = []
+            current_user_parts = []
             for pil_img in input_images_group:
-                contents.append(pil_img)
+                current_user_parts.append(pil_to_part(pil_img))
 
             full_prompt_text = user_prompt.strip() if user_prompt else ""
             if input_images_group and full_prompt_text:
@@ -146,7 +206,18 @@ class XiGeminiNode:
                 full_prompt_text = f"{full_prompt_text}{guidance}".strip()
 
             if full_prompt_text:
-                contents.append(full_prompt_text)
+                current_user_parts.append(types.Part.from_text(text=full_prompt_text))
+
+            contents = []
+            if context_memory == "enable":
+                raw_history = get_context_history(session_id)
+                # 过滤不含大图 Base64 并进行 512KB 体积限制自动压缩
+                clean_history = sanitize_and_trim_history(raw_history)
+                contents.extend(clean_history)
+
+            # 构建当前轮强类型 Content 对象
+            user_content_obj = types.Content(role="user", parts=current_user_parts)
+            contents.append(user_content_obj)
 
             config_kwargs = {
                 "temperature": float(temperature),
@@ -195,10 +266,13 @@ class XiGeminiNode:
 
             sub_parsed_imgs = []
             sub_raw_texts = []
+            response_model_parts = []
+
             if response and response.candidates:
                 for candidate in response.candidates:
                     if candidate.content and candidate.content.parts:
                         for part in candidate.content.parts:
+                            response_model_parts.append(part)
                             if part.inline_data and part.inline_data.data:
                                 try:
                                     img_bytes = part.inline_data.data
@@ -209,9 +283,28 @@ class XiGeminiNode:
                             elif part.text:
                                 sub_raw_texts.append(part.text)
 
+            # 更新会话历史记忆 (只记文本，不记图片 Base64)
+            if context_memory == "enable":
+                history = get_context_history(session_id)
+                # 记录 user 轮纯文本 (若无文本，用占位符号)
+                txt_user_parts = [p for p in current_user_parts if hasattr(p, 'text') and p.text]
+                if not txt_user_parts:
+                    txt_user_parts = [types.Part.from_text(text="[Provided reference image]")]
+                history.append(types.Content(role="user", parts=txt_user_parts))
+
+                # 记录 model 轮纯文本
+                txt_model_parts = [p for p in response_model_parts if hasattr(p, 'text') and p.text]
+                if not txt_model_parts:
+                    txt_model_parts = [types.Part.from_text(text="[Generated image successfully]")]
+                history.append(types.Content(role="model", parts=txt_model_parts))
+
+                # 执行 512KB 自动瘦身与限制裁剪
+                GLOBAL_CONTEXT_MEMORY[session_id] = sanitize_and_trim_history(history)
+                print(f"[XiNodes Gemini Memory] Updated session '{session_id}' history (Lightweight text-only messages: {len(GLOBAL_CONTEXT_MEMORY[session_id])}).")
+
             return sub_parsed_imgs, sub_raw_texts
 
-        # 3. 核心分支逻辑：处理多张参考图的两种工作模式
+        # 5. 执行模式分支
         all_output_imgs = []
         all_output_texts = []
 
@@ -221,7 +314,6 @@ class XiGeminiNode:
                 eff_ar = aspect_ratio
                 if eff_ar == "Auto":
                     eff_ar = detect_closest_aspect_ratio(single_pil)
-                    print(f"[XiNodes Gemini SDK] Image #{idx+1} auto-detected aspect ratio: {eff_ar}")
 
                 imgs_res, txts_res = _call_single_generate([single_pil], eff_ar)
                 all_output_imgs.extend(imgs_res)
@@ -230,20 +322,18 @@ class XiGeminiNode:
             eff_ar = aspect_ratio
             if eff_ar == "Auto" and len(input_pil_images) > 0:
                 eff_ar = detect_closest_aspect_ratio(input_pil_images[0])
-                print(f"[XiNodes Gemini SDK] Primary image auto-detected aspect ratio: {eff_ar}")
 
             imgs_res, txts_res = _call_single_generate(input_pil_images, eff_ar)
             all_output_imgs.extend(imgs_res)
             all_output_texts.extend(txts_res)
 
-        # 4. 精准互斥输出判断，并将解出的所有独立图片作为 Tensor Batch 堆叠
+        # 6. 输出解析与互斥判断
         if all_output_imgs:
             tensors = []
             target_size = all_output_imgs[0].size
             for img in all_output_imgs:
                 if img.size != target_size:
                     img = img.resize(target_size, Image.Resampling.BILINEAR)
-                print(f"[XiNodes Gemini SDK] Extracted separate output image size: {img.size[0]}x{img.size[1]}")
                 np_img = np.array(img).astype(np.float32) / 255.0
                 tensors.append(torch.from_numpy(np_img))
             
