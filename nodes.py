@@ -1,12 +1,16 @@
-import os
+﻿import os
 import torch
 import numpy as np
 from PIL import Image, ImageOps
 
+try:
+    from .openai_node import XiGeminiNode
+except ImportError:
+    from openai_node import XiGeminiNode
+
 class XiMultiFolderImageLoader:
     @classmethod
     def INPUT_TYPES(s):
-        # 初始化 10 个预置插槽的定义
         req = {
             "folder_count": ("INT", {"default": 3, "min": 1, "max": 10, "step": 1}),
             "index": ("INT", {"default": 0, "min": 0, "max": 10000000}),
@@ -16,8 +20,6 @@ class XiMultiFolderImageLoader:
             req[f"folder_{i}"] = ("STRING", {"default": "", "multiline": False})
         return {"required": req}
 
-    # 一次性静态注册包含 10组交替 (IMAGE, PATH) + 1路 FILENAME 的巨型返回规格参数
-    # 采用交织排列能完美地配合前端的数组动态修剪而不至于打乱索引或者中断之前接好的线路
     _ret_types = []
     _ret_names = []
     for i in range(1, 11):
@@ -47,16 +49,11 @@ class XiMultiFolderImageLoader:
         return files
 
     def load_specific_base(self, folder, files, target_base):
-        # 如果未提供或者此槽位并非目标考察区域，由外部直接拦断，此处只管取文件
         if not folder or not os.path.exists(folder):
             return None, "", ""
-
         matched_file = next((f for f in files if f['base'] == target_base), None)
-        
         if matched_file is None:
-            # 严格控制组：遇到找不到的就报错阻断执行！
-            raise ValueError(f"Sync Match Error: Target Folder '{folder}' does NOT contain any supported image named '{target_base}'. All active folders chosen within folder_count limit must contain an identical filename sequence.")
-        
+            raise ValueError(f"Sync Match Error: Target Folder '{folder}' does NOT contain any supported image named '{target_base}'.")
         image_path = os.path.join(folder, matched_file['full'])
         ext = matched_file['ext']
         try:
@@ -75,23 +72,18 @@ class XiMultiFolderImageLoader:
     def load_images(self, folder_count, index, include_extension=False, **kwargs):
         folders = [kwargs.get(f"folder_{i}", "") for i in range(1, 11)]
         files_array = []
-        
-        # 将在限制范围内的且存在合法路径的槽位数据纳入检索，丢弃空槽或者超出个数限制以外的所有影响变量
         for i in range(10):
             if i < folder_count and folders[i] and os.path.exists(folders[i]):
                 files_array.append(self.get_supported_images(folders[i]))
             else:
                 files_array.append([])
 
-        # 抽取出全网所有合法集合文件夹中共有的，或者各异的基础图片名称合并排序为一个统一基底轮播清单
         all_bases = set()
         for i in range(folder_count):
             if files_array[i]: 
                 all_bases.update([f['base'] for f in files_array[i]])
                 
         sorted_bases = sorted(list(all_bases))
-         
-        # 若大盘整体搜空，返回无状态交织格式
         if len(sorted_bases) == 0:
             print("[XiNodes Info]: No valid images found crossing all input folders limits.")
             empty_returns = []
@@ -100,13 +92,10 @@ class XiMultiFolderImageLoader:
             empty_returns.append("")
             return tuple(empty_returns)
             
-        # 超界防无限死循环检测截断机制
         if index >= len(sorted_bases):
-            raise ValueError(f"XiNodes -> Index ({index}) reaches the end! Stopping auto-queue loop. Total processed: {len(sorted_bases)}.")
+            raise ValueError(f"XiNodes -> Index ({index}) reaches the end! Total processed: {len(sorted_bases)}.")
 
         current_base = sorted_bases[index]
-
-        # 从 1~10 对各渠道并行进行寻迹读取与数据合成返回
         images_result = []
         paths_result = []
         first_valid_ext = ""
@@ -114,25 +103,20 @@ class XiMultiFolderImageLoader:
         for i in range(10):
             folder = folders[i]
             files = files_array[i]
-            # 只有位于设定参与数目，且具有合法填充才进行检索动作：
             if i < folder_count and folder and os.path.exists(folder):
                 img, path, ext = self.load_specific_base(folder, files, current_base)
                 images_result.append(img)
                 paths_result.append(path)
-                # 记录最先找到的某个真实有效被使用文件的扩展后缀（以备 filename 输出时补充完整）
                 if ext and not first_valid_ext:
                     first_valid_ext = ext
             else:
-                # 不符合要求的越界通道直接留空丢弃，向外输出 None 和 ""
                 images_result.append(None)
                 paths_result.append("")
 
-        # 整理 FILENAME 的尾端处理
         final_filename = current_base
         if include_extension and first_valid_ext:
              final_filename += first_valid_ext
 
-        # 交织装配输出，向外推送
         final_returns = []
         for i in range(10):
             final_returns.append(images_result[i])
@@ -170,12 +154,9 @@ class XiSaveTextFile:
 
     def save_text_file(self, text, path="./output", filename_prefix="ComfyUI", filename_delimiter="_", filename_number_padding=5, file_extension="txt", encoding="utf-8", filename_suffix=""):
         import folder_paths
-        
-        # 1. 整理基准目录
         try:
             base_output_dir = folder_paths.get_output_directory()
         except Exception:
-            # 兼容非ComfyUI环境下测试
             base_output_dir = os.path.abspath("./output")
             
         path = path.strip()
@@ -184,27 +165,20 @@ class XiSaveTextFile:
         filename_suffix = filename_suffix.strip()
         file_extension = file_extension.strip()
         
-        # 处理扩展名，去掉开头的点号（如果有）
         if file_extension.startswith("."):
             file_extension = file_extension[1:]
             
-        # 处理保存路径
         if os.path.isabs(path):
             target_dir = path
         else:
-            # 移去可能的前导 ./ 或 .\
             clean_path = path
             if clean_path.startswith("./") or clean_path.startswith(".\\"):
                 clean_path = clean_path[2:]
-            
-            # 如果 clean_path 为空或者是 "output"，则直接使用 base_output_dir 自身
-            # 防止生成 output/output 的尴尬局面
             if not clean_path or clean_path.lower() == "output":
                 target_dir = base_output_dir
             else:
                 target_dir = os.path.abspath(os.path.join(base_output_dir, clean_path))
                 
-        # 2. 递增查找下一个可用的文件名
         counter = 1
         while True:
             padded_counter = str(counter).zfill(filename_number_padding)
@@ -214,10 +188,7 @@ class XiSaveTextFile:
                 break
             counter += 1
             
-        # 3. 确保目录存在
         os.makedirs(target_dir, exist_ok=True)
-        
-        # 4. 写入文件
         try:
             with open(full_file_path, "w", encoding=encoding) as f:
                 f.write(text)
@@ -225,7 +196,6 @@ class XiSaveTextFile:
             print(f"[XiNodes Error] Failed to write text file to {full_file_path}: {e}")
             raise e
             
-        # 返回 ui 字段给 comfyui，同时返回 text 以连线到下游
         return {
             "ui": {
                 "text": [text],
@@ -258,20 +228,16 @@ class XiImageBatchCrossfade:
     CATEGORY = "XiNodes"
 
     def crossfade(self, images_a, images_b, transition_frames, transition_type, resize_behavior, alpha_handling, frame_duration_behavior="freeze_ends"):
-        # 1. 确保输入是 4D 张量 (B, H, W, C)
         if len(images_a.shape) == 3:
             images_a = images_a.unsqueeze(0)
         if len(images_b.shape) == 3:
             images_b = images_b.unsqueeze(0)
             
-        # 2. 处理 Alpha 通道
         def apply_alpha_handling(img, handling):
             if img.shape[-1] != 4:
                 return img
-            
             rgb = img[..., :3]
             alpha = img[..., 3:]
-            
             if handling == "layer_on_black":
                 return rgb * alpha
             elif handling == "layer_on_white":
@@ -279,7 +245,7 @@ class XiImageBatchCrossfade:
             elif handling == "layer_on_green":
                 green_color = torch.tensor([0.0, 1.0, 0.0], dtype=rgb.dtype, device=rgb.device).view(1, 1, 1, 3)
                 return rgb * alpha + (1.0 - alpha) * green_color
-            else: # keep_alpha_channels
+            else:
                 return img
 
         images_a = apply_alpha_handling(images_a, alpha_handling)
@@ -288,7 +254,6 @@ class XiImageBatchCrossfade:
         N_A, H_A, W_A, C_A = images_a.shape
         N_B, H_B, W_B, C_B = images_b.shape
 
-        # 3. 处理通道数不匹配
         if C_A != C_B:
             if C_A > 3:
                 images_a = images_a[..., :3]
@@ -301,12 +266,10 @@ class XiImageBatchCrossfade:
                 C_A = 3
             elif C_A == 3 and C_B == 1:
                 images_b = images_b.repeat(1, 1, 1, 3)
-                C_B = 3
+                C_A = 3
 
-        # 4. 处理分辨率不匹配
         if H_A != H_B or W_A != W_B:
             if resize_behavior == "resize_to_match_a":
-                # 将 B 缩放到 A 的分辨率
                 images_b_permuted = images_b.permute(0, 3, 1, 2)
                 images_b_resized = torch.nn.functional.interpolate(
                     images_b_permuted, size=(H_A, W_A), mode="bilinear", align_corners=False
@@ -314,7 +277,6 @@ class XiImageBatchCrossfade:
                 images_b = images_b_resized.permute(0, 2, 3, 1)
                 H_B, W_B = H_A, W_A
             elif resize_behavior == "resize_to_match_b":
-                # 将 A 缩放到 B 的分辨率
                 images_a_permuted = images_a.permute(0, 3, 1, 2)
                 images_a_resized = torch.nn.functional.interpolate(
                     images_a_permuted, size=(H_B, W_B), mode="bilinear", align_corners=False
@@ -324,23 +286,19 @@ class XiImageBatchCrossfade:
             elif resize_behavior == "error":
                 raise ValueError(f"Resolution mismatch between images_a ({W_A}x{H_A}) and images_b ({W_B}x{H_B}) and resize_behavior is 'error'.")
 
-        # 5. 确定实际的过渡帧数
         actual_transition = min(transition_frames, N_A, N_B)
         if actual_transition < transition_frames:
             print(f"[XiNodes Warning] Requested transition_frames ({transition_frames}) is larger than one of the batch sizes (A: {N_A}, B: {N_B}). Capping transition to {actual_transition} frames.")
 
-        # 6. 执行过渡或直接拼接
         if actual_transition == 0:
             out_images = torch.cat([images_a, images_b], dim=0)
             return (out_images,)
 
-        # 权重系数 alphas
         if actual_transition == 1:
             alphas = torch.tensor([0.5], dtype=images_a.dtype, device=images_a.device)
         else:
             alphas = torch.linspace(0.0, 1.0, steps=actual_transition, dtype=images_a.dtype, device=images_a.device)
 
-        # 应用过渡曲线
         if transition_type == "ease_in":
             alphas = alphas ** 2
         elif transition_type == "ease_out":
@@ -352,34 +310,23 @@ class XiImageBatchCrossfade:
 
         parts = []
         if frame_duration_behavior == "reduce_frames":
-            # reduce_frames (原重叠模式，总帧数减少 actual_transition)
             images_a_part = images_a[:N_A - actual_transition]
             images_b_part = images_b[actual_transition:]
             fade_out = images_a[-actual_transition:]
             fade_in = images_b[:actual_transition]
             transition_part = (1.0 - alphas) * fade_out + alphas * fade_in
-
             if images_a_part.shape[0] > 0:
                 parts.append(images_a_part)
             parts.append(transition_part)
             if images_b_part.shape[0] > 0:
                 parts.append(images_b_part)
-
         else:
-            # 默认为 freeze_ends (冻结 A 的尾部 n_freeze_a 帧与 B 的首部 n_freeze_b 帧，总帧数保持 N_A + N_B)
-            # 这样做可以完美向后兼容旧版工作流或缓存缺失该参数导致传参为 None 的情况
             n_freeze_a = (actual_transition + 1) // 2
             n_freeze_b = actual_transition // 2
-
-            # 构造 fade_out (长度为 actual_transition)
-            # 前半段为 A 的最后 n_freeze_a 帧，后半段为 A 的最后一帧重复 n_freeze_b 次
             fade_out_list = [images_a[-n_freeze_a:]]
             if n_freeze_b > 0:
                 fade_out_list.append(images_a[-1:].repeat(n_freeze_b, 1, 1, 1))
             fade_out = torch.cat(fade_out_list, dim=0)
-
-            # 构造 fade_in (长度为 actual_transition)
-            # 前半段为 B 的首帧重复 n_freeze_a 次，后半段为 B 的前 n_freeze_b 帧
             fade_in_list = []
             if n_freeze_a > 0:
                 fade_in_list.append(images_b[0:1].repeat(n_freeze_a, 1, 1, 1))
@@ -387,10 +334,7 @@ class XiImageBatchCrossfade:
                 fade_in_list.append(images_b[:n_freeze_b])
             fade_in = torch.cat(fade_in_list, dim=0)
 
-            # 叠化过渡段
             transition_part = (1.0 - alphas) * fade_out + alphas * fade_in
-
-            # 拼接非混合部分
             images_a_part = images_a[:-n_freeze_a]
             images_b_part = images_b[n_freeze_b:]
 
@@ -406,11 +350,13 @@ class XiImageBatchCrossfade:
 NODE_CLASS_MAPPINGS = {
     "XiMultiFolderImageLoader": XiMultiFolderImageLoader,
     "XiSaveTextFile": XiSaveTextFile,
-    "XiImageBatchCrossfade": XiImageBatchCrossfade
+    "XiImageBatchCrossfade": XiImageBatchCrossfade,
+    "XiGeminiNode": XiGeminiNode
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "XiMultiFolderImageLoader": "Multi Folder Image Loader",
     "XiSaveTextFile": "Save Text File",
-    "XiImageBatchCrossfade": "Image Batch Crossfade"
+    "XiImageBatchCrossfade": "Image Batch Crossfade",
+    "XiGeminiNode": "Gemini API Node"
 }
