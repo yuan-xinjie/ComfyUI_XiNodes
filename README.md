@@ -15,3 +15,7 @@
 
 给两段视频添加叠化过渡效果，可自定义：过渡时长(帧数)，根据批次resize(a/b)，透明通道处理
 
+## Gemini API Node
+
+google-genai协议的api节点，可以用于chat和image，可自定义url,key,model,生图比例、分辨率，最多输入三张图，可输出图像或文本
+
