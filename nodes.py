@@ -4,9 +4,9 @@ import numpy as np
 from PIL import Image, ImageOps
 
 try:
-    from .openai_node import XiGeminiNode
+    from .gemini_api_node import XiGeminiNode
 except ImportError:
-    from openai_node import XiGeminiNode
+    from gemini_api_node import XiGeminiNode
 
 class XiMultiFolderImageLoader:
     @classmethod
