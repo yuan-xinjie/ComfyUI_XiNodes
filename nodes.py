@@ -4,9 +4,9 @@ import numpy as np
 from PIL import Image, ImageOps
 
 try:
-    from .gemini_api_node import XiGeminiNode
+    from .gemini_api_node import XiGeminiAPI
 except ImportError:
-    from gemini_api_node import XiGeminiNode
+    from gemini_api_node import XiGeminiAPI
 
 class XiMultiFolderImageLoader:
     @classmethod
@@ -351,12 +351,12 @@ NODE_CLASS_MAPPINGS = {
     "XiMultiFolderImageLoader": XiMultiFolderImageLoader,
     "XiSaveTextFile": XiSaveTextFile,
     "XiImageBatchCrossfade": XiImageBatchCrossfade,
-    "XiGeminiNode": XiGeminiNode
+    "XiGeminiAPI": XiGeminiAPI
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "XiMultiFolderImageLoader": "Multi Folder Image Loader",
     "XiSaveTextFile": "Save Text File",
     "XiImageBatchCrossfade": "Image Batch Crossfade",
-    "XiGeminiNode": "Gemini API Node"
+    "XiGeminiAPI": "Gemini API"
 }

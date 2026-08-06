@@ -56,11 +56,8 @@ def clean_text_media_references(text):
     return "\n".join(lines)
 
 
-# ==========================================
-# 上下文记忆历史缓存 (最大 512KB，不保存图片 Base64)
-# ==========================================
 GLOBAL_CONTEXT_MEMORY = {}
-MAX_CONTEXT_BYTES = 512 * 1024  # 512 KB (524288 字节)
+MAX_CONTEXT_BYTES = 512 * 1024  # 512 KB
 
 def get_context_history(session_id):
     if session_id not in GLOBAL_CONTEXT_MEMORY:
@@ -75,10 +72,6 @@ def clear_context_history(session_id=None):
         GLOBAL_CONTEXT_MEMORY.clear()
 
 def sanitize_and_trim_history(history_list):
-    """
-    1. 彻底过滤并移除 Content 对象中的图片/二进制数据，仅保留纯文本。
-    2. 计算总体字节数，若超过 512KB，则自动从最早的历史轮次开始自动裁剪/压缩，直到 <= 512KB。
-    """
     clean_history = []
     for item in history_list:
         if not isinstance(item, types.Content):
@@ -87,11 +80,9 @@ def sanitize_and_trim_history(history_list):
         clean_parts = []
         if item.parts:
             for p in item.parts:
-                # 只保留包含文本的 Part，丢弃所有 inline_data / bytes 图片
                 if hasattr(p, 'text') and p.text and str(p.text).strip():
                     clean_parts.append(types.Part.from_text(text=str(p.text).strip()))
         
-        # 若该轮仅生成了图片而无文本，记录简洁轻量的占位说明
         if not clean_parts:
             if item.role == "model":
                 clean_parts.append(types.Part.from_text(text="[Generated image successfully]"))
@@ -100,7 +91,6 @@ def sanitize_and_trim_history(history_list):
 
         clean_history.append(types.Content(role=item.role, parts=clean_parts))
 
-    # 计算全局字节数并自动滑动裁剪压缩
     def calc_bytes(cnts):
         total = 0
         for c in cnts:
@@ -110,7 +100,6 @@ def sanitize_and_trim_history(history_list):
         return total
 
     while clean_history and calc_bytes(clean_history) > MAX_CONTEXT_BYTES:
-        # 一次剔除最早的一对 user + model 消息
         if len(clean_history) >= 2:
             clean_history = clean_history[2:]
         else:
@@ -122,7 +111,7 @@ def sanitize_and_trim_history(history_list):
 # ==========================================
 # Google GenAI 官方 SDK 驱动节点 (Gemini API Node)
 # ==========================================
-class XiGeminiNode:
+class XiGeminiAPI:
     def __init__(self):
         pass
 
@@ -133,6 +122,7 @@ class XiGeminiNode:
                 "base_url": ("STRING", {"default": "https://generativelanguage.googleapis.com", "multiline": False}),
                 "api_key": ("STRING", {"default": "", "multiline": False}),
                 "model": ("STRING", {"default": "gemini-3.1-flash-image", "multiline": False}),
+                "mode": (["image", "chat", "auto"], {"default": "image"}),
                 "system_prompt": ("STRING", {"default": "", "multiline": True}),
                 "user_prompt": ("STRING", {"default": "", "multiline": True}),
                 "aspect_ratio": (["Auto", "1:1", "3:4", "4:3", "9:16", "16:9", "2:3", "3:2", "4:5", "5:4", "21:9"], {"default": "Auto"}),
@@ -157,7 +147,7 @@ class XiGeminiNode:
     OUTPUT_NODE = True
     CATEGORY = "XiNodes"
 
-    def request_gemini(self, base_url, api_key, model, system_prompt, user_prompt, aspect_ratio, resolution, context_memory, clear_history, multi_image_mode, temperature, seed, timeout, **kwargs):
+    def request_gemini(self, base_url, api_key, model, mode, system_prompt, user_prompt, aspect_ratio, resolution, context_memory, clear_history, multi_image_mode, temperature, seed, timeout, **kwargs):
         # 1. 历史记忆控制
         session_id = f"{model.strip()}_{base_url.strip()}"
         if clear_history:
@@ -201,9 +191,19 @@ class XiGeminiNode:
                 current_user_parts.append(pil_to_part(pil_img))
 
             full_prompt_text = user_prompt.strip() if user_prompt else ""
-            if input_images_group and full_prompt_text:
-                guidance = " Please modify and edit the input image exactly according to the prompt instructions."
-                full_prompt_text = f"{full_prompt_text}{guidance}".strip()
+            
+            # 根据 mode 定向注入生图/Chat 指导说明
+            if mode == "image":
+                if input_images_group and full_prompt_text:
+                    guidance = " [System Directive: You MUST generate and output a newly modified image based on the input image and instructions. Do not answer with text alone.]"
+                    full_prompt_text = f"{full_prompt_text}{guidance}".strip()
+                elif full_prompt_text:
+                    guidance = " [System Directive: You MUST generate and output an image corresponding to the prompt. Do not answer with text alone.]"
+                    full_prompt_text = f"{full_prompt_text}{guidance}".strip()
+            elif mode == "chat":
+                if full_prompt_text:
+                    guidance = " [System Directive: Answer with text response only. Do not generate an image.]"
+                    full_prompt_text = f"{full_prompt_text}{guidance}".strip()
 
             if full_prompt_text:
                 current_user_parts.append(types.Part.from_text(text=full_prompt_text))
@@ -211,17 +211,21 @@ class XiGeminiNode:
             contents = []
             if context_memory == "enable":
                 raw_history = get_context_history(session_id)
-                # 过滤不含大图 Base64 并进行 512KB 体积限制自动压缩
                 clean_history = sanitize_and_trim_history(raw_history)
                 contents.extend(clean_history)
 
-            # 构建当前轮强类型 Content 对象
             user_content_obj = types.Content(role="user", parts=current_user_parts)
             contents.append(user_content_obj)
 
             config_kwargs = {
                 "temperature": float(temperature),
             }
+
+            # 配置 response_modalities 强制模式控制
+            if mode == "image":
+                config_kwargs["response_modalities"] = ["IMAGE"]
+            elif mode == "chat":
+                config_kwargs["response_modalities"] = ["TEXT"]
 
             if system_prompt and system_prompt.strip():
                 config_kwargs["system_instruction"] = system_prompt.strip()
@@ -248,7 +252,16 @@ class XiGeminiNode:
                 )
             except Exception as e:
                 err_msg = str(e)
-                if ("Image size" in err_msg or "not supported" in err_msg) and "image_config" in config_kwargs:
+                if ("response_modalities" in err_msg or "responseModalities" in err_msg) and "response_modalities" in config_kwargs:
+                    print(f"[XiNodes Gemini SDK Warning] Gateway does not support response_modalities ({err_msg}). Retrying without it...")
+                    config_kwargs.pop("response_modalities", None)
+                    config_retry = types.GenerateContentConfig(**config_kwargs)
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=config_retry,
+                    )
+                elif ("Image size" in err_msg or "not supported" in err_msg) and "image_config" in config_kwargs:
                     print(f"[XiNodes Gemini SDK Warning] Resolution limit error ({err_msg}). Retrying without image_size...")
                     image_config_kwargs.pop("image_size", None)
                     if image_config_kwargs:
@@ -283,22 +296,19 @@ class XiGeminiNode:
                             elif part.text:
                                 sub_raw_texts.append(part.text)
 
-            # 更新会话历史记忆 (只记文本，不记图片 Base64)
+            # 更新会话历史记忆
             if context_memory == "enable":
                 history = get_context_history(session_id)
-                # 记录 user 轮纯文本 (若无文本，用占位符号)
                 txt_user_parts = [p for p in current_user_parts if hasattr(p, 'text') and p.text]
                 if not txt_user_parts:
                     txt_user_parts = [types.Part.from_text(text="[Provided reference image]")]
                 history.append(types.Content(role="user", parts=txt_user_parts))
 
-                # 记录 model 轮纯文本
                 txt_model_parts = [p for p in response_model_parts if hasattr(p, 'text') and p.text]
                 if not txt_model_parts:
                     txt_model_parts = [types.Part.from_text(text="[Generated image successfully]")]
                 history.append(types.Content(role="model", parts=txt_model_parts))
 
-                # 执行 512KB 自动瘦身与限制裁剪
                 GLOBAL_CONTEXT_MEMORY[session_id] = sanitize_and_trim_history(history)
                 print(f"[XiNodes Gemini Memory] Updated session '{session_id}' history (Lightweight text-only messages: {len(GLOBAL_CONTEXT_MEMORY[session_id])}).")
 
@@ -327,7 +337,7 @@ class XiGeminiNode:
             all_output_imgs.extend(imgs_res)
             all_output_texts.extend(txts_res)
 
-        # 6. 输出解析与互斥判断
+        # 6. 输出解析与纯粹 None 导出
         if all_output_imgs:
             tensors = []
             target_size = all_output_imgs[0].size
