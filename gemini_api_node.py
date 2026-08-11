@@ -360,3 +360,11 @@ class XiGeminiAPI:
             },
             "result": (out_image_tensor, out_text)
         }
+
+NODE_CLASS_MAPPINGS = {
+    "XiGeminiAPI": XiGeminiAPI,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "XiGeminiAPI": "Gemini API",
+}

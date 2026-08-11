@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ComfyUI_XiNodes"
 version = "1.0.0"
-description = "A custom node for ComfyUI to load and synchronize images from multiple folders for batch processing."
+description = "A custom node for ComfyUI."
 authors = [
   { name="yuan-xinjie" }
 ]

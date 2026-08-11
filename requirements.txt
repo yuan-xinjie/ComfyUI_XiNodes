@@ -1,3 +1,5 @@
+ast
+json
 torch>=2.0.0
 numpy
 Pillow
