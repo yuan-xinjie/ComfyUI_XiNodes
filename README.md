@@ -13,7 +13,7 @@
 
 ## Save Audio
 
-保存音频节点，输入/输出均为 ComfyUI AUDIO 类型（透传）。可自定义：文件名前缀、格式（m4a/wav/flac/mp3/ogg/opus，默认 m4a）、采样率（默认 44100Hz）、码率（默认 128kbps）。保存到 ComfyUI output 目录，前端可播放。
+保存音频节点，输入/输出均为 ComfyUI AUDIO 类型（透传）。可自定义：文件名前缀、格式（m4a/wav/flac/mp3/ogg/opus，默认 m4a）、采样率（默认 44100Hz）、码率（默认 128kbps）。保存到 ComfyUI output 目录，前端可播放，并把 ComfyUI 工作流数据写入音频文件（m4a/mp3/flac/ogg/opus），拖回 ComfyUI 界面可直接恢复工作流。
 
 > 依赖 `av`（PyAV）；重采样优先使用 ComfyUI 自带的 `torchaudio`，缺失时自动降级为 numpy 线性插值。
 

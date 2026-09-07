@@ -29,6 +29,52 @@ function buildAudioUrl(item) {
 
 app.registerExtension({
     name: "XiNodes.SaveAudioPreview",
+    setup() {
+        // ComfyUI's built-in file-drop workflow loader knows PNG/MP3/FLAC/etc.,
+        // but in many frontend versions it does not try to parse .m4a files.
+        // Our node writes prompt/workflow into M4A as ISOBMFF udta/meta/ilst,
+        // so we teach the same drop handler to read that for .m4a files.
+        const originalHandleFile = app.handleFile;
+        if (typeof originalHandleFile !== "function") return;
+
+        app.handleFile = async function (file, ...args) {
+            const name = typeof file?.name === "string" ? file.name : "";
+            const isM4a =
+                name.toLowerCase().endsWith(".m4a") ||
+                file.type === "audio/mp4" ||
+                file.type === "audio/x-m4a";
+
+            if (isM4a) {
+                try {
+                    const parseIsobmff = window.comfyAPI?.isobmff?.getFromIsobmffFile;
+                    if (typeof parseIsobmff === "function") {
+                        const meta = await parseIsobmff(file);
+                        const payload =
+                            meta?.workflow ??
+                            meta?.Workflow ??
+                            meta?.prompt ??
+                            meta?.Prompt;
+
+                        if (payload) {
+                            const text = typeof payload === "string"
+                                ? payload
+                                : JSON.stringify(payload);
+                            const jsonFile = new File(
+                                [text],
+                                name.replace(/\.m4a$/i, ".json"),
+                                { type: "application/json" }
+                            );
+                            return originalHandleFile.call(this, jsonFile, ...args);
+                        }
+                    }
+                } catch (e) {
+                    console.warn("[XiNodes] Failed to extract workflow from m4a:", e);
+                }
+            }
+
+            return originalHandleFile.call(this, file, ...args);
+        };
+    },
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== "XiSaveAudio" || !nodeData.input?.required) return;
 

@@ -2,3 +2,5 @@ torch>=2.0.0
 numpy
 Pillow
 google-genai
+av
+# torchaudio is usually bundled with ComfyUI's torch; install the torch-matching version if missing.

@@ -228,9 +228,22 @@ class XiSaveAudio:
 
             output_container = None
             try:
-                output_container = av.open(output_path, mode="w", format=container_format)
+                if fmt == "m4a":
+                    # ISOBMFF (MP4/M4A) only keeps arbitrary tags when
+                    # `movflags use_metadata_tags` is set. ComfyUI's frontend
+                    # reads prompt/workflow from exactly this udta/meta/ilst data.
+                    output_container = av.open(
+                        output_path,
+                        mode="w",
+                        format=container_format,
+                        options={"movflags": "use_metadata_tags"},
+                    )
+                else:
+                    output_container = av.open(output_path, mode="w", format=container_format)
 
-                # Metadata must be set before muxing starts.
+                # Metadata must be set before muxing starts. Some muxers only
+                # keep tags on the container (mp3/flac/m4a) while others only
+                # keep tags on the stream (ogg/opus), so try both.
                 for key, value in metadata.items():
                     try:
                         output_container.metadata[key] = value
@@ -238,6 +251,12 @@ class XiSaveAudio:
                         pass
 
                 out_stream = output_container.add_stream(codec, rate=target_sample_rate, layout=layout)
+                for key, value in metadata.items():
+                    try:
+                        out_stream.metadata[key] = value
+                    except Exception:
+                        pass
+
                 if supports_bitrate:
                     out_stream.bit_rate = bitrate
 
