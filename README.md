@@ -11,6 +11,12 @@
 
 保存文本节点，可自定义：保存路径、文件前缀、分隔符、数字padding、后缀、文件格式、编码格式，可被ComfyUI的historyData.outputs捕捉
 
+## Save Audio
+
+保存音频节点，输入/输出均为 ComfyUI AUDIO 类型（透传）。可自定义：文件名前缀、格式（m4a/wav/flac/mp3/ogg/opus，默认 m4a）、采样率（默认 44100Hz）、码率（默认 128kbps）。保存到 ComfyUI output 目录，前端可播放。
+
+> 依赖 `av`（PyAV）；重采样优先使用 ComfyUI 自带的 `torchaudio`，缺失时自动降级为 numpy 线性插值。
+
 ## Image Batch Crossfade
 
 给两段视频添加叠化过渡效果，可自定义：过渡时长(帧数)，根据批次resize(a/b)，透明通道处理
