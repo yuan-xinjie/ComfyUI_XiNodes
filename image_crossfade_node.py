@@ -1,30 +1,37 @@
 ﻿import torch
+from comfy_api.latest import io
 
 
-class XiImageBatchCrossfade:
+class XiImageBatchCrossfade(io.ComfyNode):
     def __init__(self):
         pass
 
     @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "images_a": ("IMAGE",),
-                "images_b": ("IMAGE",),
-                "transition_frames": ("INT", {"default": 10, "min": 0, "max": 10000, "step": 1}),
-                "transition_type": (["linear", "ease_in", "ease_out", "ease_in_out"], {"default": "linear"}),
-                "resize_behavior": (["resize_to_match_a", "resize_to_match_b", "error"], {"default": "resize_to_match_a"}),
-                "alpha_handling": (["keep_alpha_channels", "layer_on_black", "layer_on_white", "layer_on_green"], {"default": "keep_alpha_channels"}),
-                "frame_duration_behavior": (["freeze_ends", "reduce_frames"], {"default": "freeze_ends"}),
-            }
-        }
+    def define_schema(cls):
+        return io.Schema(
+            node_id="XiImageBatchCrossfade",
+            display_name="Image Batch Crossfade",
+            category="XiNodes",
+            description="给两段视频添加叠化过渡效果，可自定义过渡时长(帧数)、根据批次resize(a/b)、透明通道处理。",
+            inputs=[
+                io.Image.Input("images_a", tooltip="第一段视频/图像批次。"),
+                io.Image.Input("images_b", tooltip="第二段视频/图像批次。"),
+                io.Int.Input("transition_frames", default=10, min=0, max=10000, step=1, tooltip="叠化过渡的帧数。"),
+                io.Combo.Input("transition_type", options=["linear", "ease_in", "ease_out", "ease_in_out"],
+                               default="linear", tooltip="过渡缓动曲线。"),
+                io.Combo.Input("resize_behavior", options=["resize_to_match_a", "resize_to_match_b", "error"],
+                               default="resize_to_match_a", tooltip="两段尺寸不一致时以哪一段为准，或直接报错。"),
+                io.Combo.Input("alpha_handling",
+                               options=["keep_alpha_channels", "layer_on_black", "layer_on_white", "layer_on_green"],
+                               default="keep_alpha_channels", tooltip="RGBA 输入的透明通道处理方式。"),
+                io.Combo.Input("frame_duration_behavior", options=["freeze_ends", "reduce_frames"],
+                               default="freeze_ends", tooltip="过渡期的时长处理方式。"),
+            ],
+            outputs=[io.Image.Output(display_name="IMAGE")],
+        )
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("IMAGE",)
-    FUNCTION = "crossfade"
-    CATEGORY = "XiNodes"
-
-    def crossfade(self, images_a, images_b, transition_frames, transition_type, resize_behavior, alpha_handling, frame_duration_behavior="freeze_ends"):
+    @classmethod
+    def execute(cls, images_a, images_b, transition_frames, transition_type, resize_behavior, alpha_handling, frame_duration_behavior="freeze_ends"):
         if len(images_a.shape) == 3:
             images_a = images_a.unsqueeze(0)
         if len(images_b.shape) == 3:
@@ -89,7 +96,7 @@ class XiImageBatchCrossfade:
 
         if actual_transition == 0:
             out_images = torch.cat([images_a, images_b], dim=0)
-            return (out_images,)
+            return io.NodeOutput(out_images)
 
         if actual_transition == 1:
             alphas = torch.tensor([0.5], dtype=images_a.dtype, device=images_a.device)
@@ -142,13 +149,7 @@ class XiImageBatchCrossfade:
                 parts.append(images_b_part)
 
         out_images = torch.cat(parts, dim=0)
-        return (out_images,)
+        return io.NodeOutput(out_images)
 
 
-NODE_CLASS_MAPPINGS = {
-    "XiImageBatchCrossfade": XiImageBatchCrossfade,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "XiImageBatchCrossfade": "Image Batch Crossfade",
-}
+NODES = [XiImageBatchCrossfade]

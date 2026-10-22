@@ -1,8 +1,10 @@
 import os
 import json
 
+from comfy_api.latest import io
 
-class XiSaveAudio:
+
+class XiSaveAudio(io.ComfyNode):
     """Save an AUDIO input to the ComfyUI output directory.
 
     Input/Output follows ComfyUI's AUDIO type: a dict with
@@ -24,39 +26,39 @@ class XiSaveAudio:
     }
 
     @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "audio": ("AUDIO",),
-                "filename_prefix": ("STRING", {"default": "audio/ComfyUI"}),
-                "format": (["m4a", "wav", "flac", "mp3", "ogg", "opus"], {"default": "m4a"}),
-                "sample_rate": ("INT", {"default": 44100, "min": 4000, "max": 384000, "step": 100}),
-                "bitrate_kbps": ("INT", {"default": 128, "min": 8, "max": 512, "step": 1}),
-            },
-            "hidden": {
-                "prompt": "PROMPT",
-                "extra_pnginfo": "EXTRA_PNGINFO",
-            },
-        }
-
-    RETURN_TYPES = ("AUDIO",)
-    RETURN_NAMES = ("audio",)
-    FUNCTION = "save_audio"
-    OUTPUT_NODE = True
-    CATEGORY = "XiNodes"
-    DESCRIPTION = "保存 AUDIO 到 ComfyUI output 目录，可自定义文件名前缀、格式、采样率、码率。支持 m4a/wav/flac/mp3/ogg/opus，并透传输入 AUDIO。"
+    def define_schema(cls):
+        return io.Schema(
+            node_id="XiSaveAudio",
+            display_name="Save Audio",
+            category="XiNodes",
+            is_output_node=True,
+            description="保存 AUDIO 到 ComfyUI output 目录，可自定义文件名前缀、格式、采样率、码率。支持 m4a/wav/flac/mp3/ogg/opus，并透传输入 AUDIO。",
+            inputs=[
+                io.Audio.Input("audio", tooltip="ComfyUI AUDIO 字典：{'waveform': Tensor(batch,channels,samples), 'sample_rate': int}。"),
+                io.String.Input("filename_prefix", default="audio/ComfyUI", tooltip="输出文件名前缀，可含子目录。"),
+                io.Combo.Input("format", options=["m4a", "wav", "flac", "mp3", "ogg", "opus"],
+                               default="m4a", tooltip="容器/编码格式。"),
+                io.Int.Input("sample_rate", default=44100, min=4000, max=384000, step=100,
+                             tooltip="目标采样率；opus/mp3/m4a/ogg 会自动修正到编码器允许的范围内。"),
+                io.Int.Input("bitrate_kbps", default=128, min=8, max=512, step=1,
+                             tooltip="码率（仅对 m4a/mp3/ogg/opus 等有损格式有效）。"),
+            ],
+            outputs=[io.Audio.Output(display_name="audio")],
+            hidden=[io.Hidden.prompt, io.Hidden.extra_pnginfo],
+        )
 
     # ------------------------------------------------------------------
-    def _normalize_sample_rate(self, sample_rate, fmt):
+    @classmethod
+    def _normalize_sample_rate(cls, sample_rate, fmt):
         """Clamp/repair sample rate for codecs that have strict limits."""
         sample_rate = int(sample_rate)
         if fmt == "opus":
             if sample_rate > 48000:
                 return 48000
-            if sample_rate in self.OPUS_RATES:
+            if sample_rate in cls.OPUS_RATES:
                 return sample_rate
             # Same behaviour as ComfyUI core: pick the next supported rate.
-            for rate in sorted(self.OPUS_RATES):
+            for rate in sorted(cls.OPUS_RATES):
                 if rate > sample_rate:
                     return rate
             return 48000
@@ -68,7 +70,8 @@ class XiSaveAudio:
             return max(8000, min(192000, sample_rate))
         return sample_rate
 
-    def _resample(self, waveform, orig_freq, new_freq):
+    @staticmethod
+    def _resample(waveform, orig_freq, new_freq):
         """Resample a (channels, samples) float tensor.
 
         Prefer torchaudio (ComfyUI standard). If it is missing, fall back to
@@ -94,7 +97,8 @@ class XiSaveAudio:
         print(f"[XiNodes SaveAudio Warning] torchaudio not available; used numpy linear interpolation for resampling {orig_freq}->{new_freq}.")
         return torch.from_numpy(resampled)
 
-    def _resolve_output_path(self, filename_prefix, ext):
+    @staticmethod
+    def _resolve_output_path(filename_prefix, ext):
         """Return (full_output_folder, filename, counter, subfolder).
 
         Uses ComfyUI's folder_paths when available (standard behaviour).
@@ -129,8 +133,9 @@ class XiSaveAudio:
             return full_output_folder, filename, counter, subfolder
 
     # ------------------------------------------------------------------
-    def save_audio(
-        self,
+    @classmethod
+    def execute(
+        cls,
         audio,
         filename_prefix="audio/ComfyUI",
         format="m4a",
@@ -160,12 +165,12 @@ class XiSaveAudio:
         fmt = str(format).strip().lower()
         bitrate = int(bitrate_kbps) * 1000
 
-        if fmt not in self.FORMATS:
+        if fmt not in cls.FORMATS:
             raise ValueError(
-                f"[XiNodes SaveAudio] unsupported format '{fmt}'. Supported: {list(self.FORMATS.keys())}"
+                f"[XiNodes SaveAudio] unsupported format '{fmt}'. Supported: {list(cls.FORMATS.keys())}"
             )
 
-        container_format, codec, supports_bitrate = self.FORMATS[fmt]
+        container_format, codec, supports_bitrate = cls.FORMATS[fmt]
         if not supports_bitrate:
             print(f"[XiNodes SaveAudio] format '{fmt}' is lossless/uncompressed; bitrate_kbps is ignored.")
 
@@ -188,7 +193,7 @@ class XiSaveAudio:
         layout = "mono" if channels == 1 else "stereo"
 
         # ---- 3. Repair/resample sample rate --------------------------
-        target_sample_rate = self._normalize_sample_rate(target_sample_rate, fmt)
+        target_sample_rate = cls._normalize_sample_rate(target_sample_rate, fmt)
         if target_sample_rate != int(sample_rate):
             print(
                 f"[XiNodes SaveAudio] sample_rate {int(sample_rate)} is not valid for '{fmt}'; using {target_sample_rate} instead."
@@ -196,7 +201,7 @@ class XiSaveAudio:
 
         # ---- 4. Resolve output path -----------------------------------
         ext = "m4a" if fmt == "m4a" else fmt
-        full_output_folder, filename, counter, subfolder = self._resolve_output_path(filename_prefix, ext)
+        full_output_folder, filename, counter, subfolder = cls._resolve_output_path(filename_prefix, ext)
 
         # ---- 5. Import PyAV -------------------------------------------
         try:
@@ -220,7 +225,7 @@ class XiSaveAudio:
             wav = waveform[batch_number].detach().cpu().float()
 
             if target_sample_rate != input_sample_rate:
-                wav = self._resample(wav, input_sample_rate, target_sample_rate)
+                wav = cls._resample(wav, input_sample_rate, target_sample_rate)
 
             filename_with_batch_num = filename.replace("%batch_num%", str(batch_number))
             file = f"{filename_with_batch_num}_{counter:05}.{ext}"
@@ -283,18 +288,7 @@ class XiSaveAudio:
             results.append({"filename": file, "subfolder": subfolder, "type": "output"})
             counter += 1
 
-        return {
-            "ui": {
-                "audio": results,
-            },
-            "result": (audio,),
-        }
+        return io.NodeOutput(audio, ui={"audio": results})
 
 
-NODE_CLASS_MAPPINGS = {
-    "XiSaveAudio": XiSaveAudio,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "XiSaveAudio": "Save Audio",
-}
+NODES = [XiSaveAudio]

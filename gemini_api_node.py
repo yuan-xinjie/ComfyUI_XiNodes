@@ -9,6 +9,8 @@ from PIL import Image
 from google import genai
 from google.genai import types
 
+from comfy_api.latest import io
+
 def tensor_to_pil(tensor_img, max_dim=1536):
     if len(tensor_img.shape) == 4:
         tensor_img = tensor_img[0]
@@ -111,43 +113,49 @@ def sanitize_and_trim_history(history_list):
 # ==========================================
 # Google GenAI 官方 SDK 驱动节点 (Gemini API Node)
 # ==========================================
-class XiGeminiAPI:
-    def __init__(self):
-        pass
+class XiGeminiAPI(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="XiGeminiAPI",
+            display_name="Gemini API",
+            category="XiNodes",
+            is_output_node=True,
+            description="google-genai 协议的 API 节点，可用于 chat 和 image，自定义 url、key、model、生图比例与分辨率，最多输入三张图，输出图像或文本。",
+            inputs=[
+                io.String.Input("base_url", default="https://generativelanguage.googleapis.com",
+                                tooltip="API 基地址；留空使用 Google 官方端点。非 /v1、/v1beta 结尾时自动按 v1beta 处理。"),
+                io.String.Input("api_key", default="", tooltip="API Key，留空则走默认凭据。"),
+                io.String.Input("model", default="gemini-3.1-flash-image", tooltip="模型名称。"),
+                io.Combo.Input("mode", options=["image", "chat", "auto"], default="image",
+                               tooltip="image 强制出图，chat 只要文本，auto 由模型决定。"),
+                io.String.Input("system_prompt", default="", multiline=True, tooltip="系统提示词。"),
+                io.String.Input("user_prompt", default="", multiline=True, tooltip="用户提示词。"),
+                io.Combo.Input("aspect_ratio",
+                               options=["Auto", "1:1", "3:4", "4:3", "9:16", "16:9", "2:3", "3:2", "4:5", "5:4", "21:9"],
+                               default="Auto", tooltip="Auto 时按首张输入图自动选取最接近的比例。"),
+                io.Combo.Input("resolution", options=["Auto", "512", "1K", "2K", "4K"], default="1K",
+                               tooltip="目标输出分辨率。2K/4K 使用原生高分辨率模式。"),
+                io.Combo.Input("context_memory", options=["enable", "disable"], default="enable",
+                               tooltip="enable 时按 model+url 维护会话上下文（上限 512KB）。"),
+                io.Boolean.Input("clear_history", default=False, tooltip="勾选后本次调用前清空该会话的上下文。"),
+                io.Combo.Input("multi_image_mode", options=["process_separately", "combine_in_one_prompt"],
+                               default="process_separately", tooltip="多张输入图是分别请求，还是合并进同一个 prompt。"),
+                io.Float.Input("temperature", default=1.0, min=0.0, max=2.0, step=0.01, tooltip="采样温度。"),
+                io.Int.Input("seed", default=-1, min=-1, max=2147483647, tooltip="-1 表示随机。"),
+                io.Int.Input("timeout", default=180, min=1, max=3600, step=1, tooltip="请求超时（秒）。"),
+                io.Image.Input("image_1", optional=True, tooltip="参考图 1（批次会逐张展开）。"),
+                io.Image.Input("image_2", optional=True, tooltip="参考图 2。"),
+                io.Image.Input("image_3", optional=True, tooltip="参考图 3。"),
+            ],
+            outputs=[
+                io.Image.Output(display_name="image"),
+                io.String.Output(display_name="text"),
+            ],
+        )
 
     @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "base_url": ("STRING", {"default": "https://generativelanguage.googleapis.com", "multiline": False}),
-                "api_key": ("STRING", {"default": "", "multiline": False}),
-                "model": ("STRING", {"default": "gemini-3.1-flash-image", "multiline": False}),
-                "mode": (["image", "chat", "auto"], {"default": "image"}),
-                "system_prompt": ("STRING", {"default": "", "multiline": True}),
-                "user_prompt": ("STRING", {"default": "", "multiline": True}),
-                "aspect_ratio": (["Auto", "1:1", "3:4", "4:3", "9:16", "16:9", "2:3", "3:2", "4:5", "5:4", "21:9"], {"default": "Auto"}),
-                "resolution": (["Auto", "512", "1K", "2K", "4K"], {"default": "1K"}),
-                "context_memory": (["enable", "disable"], {"default": "enable"}),
-                "clear_history": ("BOOLEAN", {"default": False}),
-                "multi_image_mode": (["process_separately", "combine_in_one_prompt"], {"default": "process_separately"}),
-                "temperature": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01}),
-                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
-                "timeout": ("INT", {"default": 180, "min": 1, "max": 3600, "step": 1}),
-            },
-            "optional": {
-                "image_1": ("IMAGE",),
-                "image_2": ("IMAGE",),
-                "image_3": ("IMAGE",),
-            }
-        }
-
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("image", "text")
-    FUNCTION = "request_gemini"
-    OUTPUT_NODE = True
-    CATEGORY = "XiNodes"
-
-    def request_gemini(self, base_url, api_key, model, mode, system_prompt, user_prompt, aspect_ratio, resolution, context_memory, clear_history, multi_image_mode, temperature, seed, timeout, **kwargs):
+    def execute(cls, base_url, api_key, model, mode, system_prompt, user_prompt, aspect_ratio, resolution, context_memory, clear_history, multi_image_mode, temperature, seed, timeout, **kwargs):
         # 1. 历史记忆控制
         session_id = f"{model.strip()}_{base_url.strip()}"
         if clear_history:
@@ -354,17 +362,6 @@ class XiGeminiAPI:
             raw_text_str = "\n".join(all_output_texts) if all_output_texts else ""
             out_text = clean_text_media_references(raw_text_str)
 
-        return {
-            "ui": {
-                "text": [out_text if out_text else ""]
-            },
-            "result": (out_image_tensor, out_text)
-        }
+        return io.NodeOutput(out_image_tensor, out_text, ui={"text": [out_text if out_text else ""]})
 
-NODE_CLASS_MAPPINGS = {
-    "XiGeminiAPI": XiGeminiAPI,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "XiGeminiAPI": "Gemini API",
-}
+NODES = [XiGeminiAPI]

@@ -3,33 +3,42 @@ import torch
 import numpy as np
 from PIL import Image, ImageOps
 
+from comfy_api.latest import io
 
-class XiMultiFolderImageLoader:
+
+class XiMultiFolderImageLoader(io.ComfyNode):
+    FOLDER_SLOTS = 10
+
     @classmethod
-    def INPUT_TYPES(s):
-        req = {
-            "folder_count": ("INT", {"default": 3, "min": 1, "max": 10, "step": 1}),
-            "index": ("INT", {"default": 0, "min": 0, "max": 10000000}),
-            "include_extension": ("BOOLEAN", {"default": False}),
-        }
-        for i in range(1, 11):
-            req[f"folder_{i}"] = ("STRING", {"default": "", "multiline": False})
-        return {"required": req}
+    def define_schema(cls):
+        # 端口名与顺序必须和 js/dynamic_ports.js 里的 folder_count / folder_N /
+        # IMAGE_N / FILE_PATH_N / FILENAME 保持一致，改动会破坏动态端口脚本。
+        inputs = [
+            io.Int.Input("folder_count", default=3, min=1, max=10, step=1,
+                         tooltip="实际启用的文件夹数量，前端据此显示/隐藏 folder_N 端口。"),
+            io.Int.Input("index", default=0, min=0, max=10000000,
+                         tooltip="按文件名排序后处理第几个同名图片组（0 起）。"),
+            io.Boolean.Input("include_extension", default=False, tooltip="FILENAME 是否带扩展名。"),
+        ]
+        for i in range(1, cls.FOLDER_SLOTS + 1):
+            inputs.append(io.String.Input("folder_{}".format(i), default="",
+                                          tooltip="第 {} 个图片文件夹的绝对路径。".format(i)))
+        outputs = []
+        for i in range(1, cls.FOLDER_SLOTS + 1):
+            outputs.append(io.Image.Output(display_name="IMAGE_{}".format(i)))
+            outputs.append(io.String.Output(display_name="FILE_PATH_{}".format(i)))
+        outputs.append(io.String.Output(display_name="FILENAME"))
+        return io.Schema(
+            node_id="XiMultiFolderImageLoader",
+            display_name="Multi Folder Image Loader",
+            category="XiNodes",
+            description="可同时加载多个文件夹内的图片，要求每个文件夹内的图片文件名一一对应，以此进行打标等批量操作。输出图像、图像路径、文件名。",
+            inputs=inputs,
+            outputs=outputs,
+        )
 
-    _ret_types = []
-    _ret_names = []
-    for i in range(1, 11):
-        _ret_types.extend(["IMAGE", "STRING"])
-        _ret_names.extend([f"IMAGE_{i}", f"FILE_PATH_{i}"])
-    _ret_types.append("STRING")
-    _ret_names.append("FILENAME")
-
-    RETURN_TYPES = tuple(_ret_types)
-    RETURN_NAMES = tuple(_ret_names)
-    FUNCTION = "load_images"
-    CATEGORY = "XiNodes"
-
-    def get_supported_images(self, folder):
+    @staticmethod
+    def get_supported_images(folder):
         if not folder or not os.path.exists(folder):
             return []
         supported_exts = {'.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tiff'}
@@ -44,7 +53,7 @@ class XiMultiFolderImageLoader:
             print(f"Error reading folder {folder}: {e}")
         return files
 
-    def load_specific_base(self, folder, files, target_base):
+    def load_specific_base(folder, files, target_base):
         if not folder or not os.path.exists(folder):
             return None, "", ""
         matched_file = next((f for f in files if f['base'] == target_base), None)
@@ -65,12 +74,13 @@ class XiMultiFolderImageLoader:
             print(f"XiNodes Loader Error: Failed to load '{image_path}': {e}")
             raise RuntimeError(f"XiNodes Loader Error: Failed to load image '{image_path}': {e}")
 
-    def load_images(self, folder_count, index, include_extension=False, **kwargs):
+    @classmethod
+    def execute(cls, folder_count, index, include_extension=False, **kwargs):
         folders = [kwargs.get(f"folder_{i}", "") for i in range(1, 11)]
         files_array = []
         for i in range(10):
             if i < folder_count and folders[i] and os.path.exists(folders[i]):
-                files_array.append(self.get_supported_images(folders[i]))
+                files_array.append(cls.get_supported_images(folders[i]))
             else:
                 files_array.append([])
 
@@ -86,7 +96,7 @@ class XiMultiFolderImageLoader:
             for i in range(10):
                 empty_returns.extend([None, ""])
             empty_returns.append("")
-            return tuple(empty_returns)
+            return io.NodeOutput(*empty_returns)
 
         if index >= len(sorted_bases):
             raise ValueError(f"XiNodes -> Index ({index}) reaches the end! Total processed: {len(sorted_bases)}.")
@@ -100,7 +110,7 @@ class XiMultiFolderImageLoader:
             folder = folders[i]
             files = files_array[i]
             if i < folder_count and folder and os.path.exists(folder):
-                img, path, ext = self.load_specific_base(folder, files, current_base)
+                img, path, ext = cls.load_specific_base(folder, files, current_base)
                 images_result.append(img)
                 paths_result.append(path)
                 if ext and not first_valid_ext:
@@ -119,13 +129,7 @@ class XiMultiFolderImageLoader:
             final_returns.append(paths_result[i])
 
         final_returns.append(final_filename)
-        return tuple(final_returns)
+        return io.NodeOutput(*final_returns)
 
 
-NODE_CLASS_MAPPINGS = {
-    "XiMultiFolderImageLoader": XiMultiFolderImageLoader,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "XiMultiFolderImageLoader": "Multi Folder Image Loader",
-}
+NODES = [XiMultiFolderImageLoader]

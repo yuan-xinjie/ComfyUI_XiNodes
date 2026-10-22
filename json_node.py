@@ -1,6 +1,8 @@
 ﻿import ast
 import json
 
+from comfy_api.latest import io
+
 
 def _parse_json_object(text, source_name):
     if text is None or not str(text).strip():
@@ -42,28 +44,26 @@ def _first(value):
     return value
 
 
-class XiJsonCreate:
+class XiJsonCreate(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "key": ("STRING", {"default": "", "multiline": False}),
-                "value": ("STRING", {"default": "", "multiline": False}),
-            },
-            "optional": {
-                "json_in": ("STRING", {"forceInput": True}),
-                "value_in": ("*", {"forceInput": True}),
-            },
-        }
+    def define_schema(cls):
+        return io.Schema(
+            node_id="XiJsonCreate",
+            display_name="Create JSON Object",
+            category="XiNodes",
+            is_input_list=True,
+            description="创建（或向已有 JSON 对象追加）一个键值对，输出双引号格式的 JSON 字符串。值优先取 value_in（可连任意类型），未连接时用 value 文本框（自动尝试解析为数字/布尔/列表/对象，失败则按字符串）。连接多元素列表时整个列表作为值。key 和 json_in 有多个输入时只取第一个。",
+            inputs=[
+                io.String.Input("key", default="", tooltip="要写入的键名，必须独一无二。"),
+                io.String.Input("value", default="", tooltip="未连接 value_in 时使用的文本值，会尝试解析为数字/布尔/列表/对象。"),
+                io.String.Input("json_in", force_input=True, optional=True, tooltip="已有的 JSON 对象，向其追加本键值对。"),
+                io.AnyType.Input("value_in", optional=True, tooltip="任意类型的值，优先于 value 文本框。"),
+            ],
+            outputs=[io.String.Output(display_name="json")],
+        )
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("json",)
-    FUNCTION = "create_json"
-    CATEGORY = "XiNodes"
-    INPUT_IS_LIST = True
-    DESCRIPTION = "创建（或向已有 JSON 对象追加）一个键值对，输出双引号格式的 JSON 字符串。值优先取 value_in（可连任意类型），未连接时用 value 文本框（自动尝试解析为数字/布尔/列表/对象，失败则按字符串）。连接多元素列表时整个列表作为值。key 和 json_in 有多个输入时只取第一个。"
-
-    def create_json(self, key, value, json_in=None, value_in=None):
+    @classmethod
+    def execute(cls, key, value, json_in=None, value_in=None):
         key_str = str(_first(key) or "").strip()
         if not key_str:
             raise ValueError("[XiNodes] 键不能为空。")
@@ -85,7 +85,7 @@ class XiJsonCreate:
             data[key_str] = [_to_jsonable(v) for v in source]
         else:
             data[key_str] = _to_jsonable(_first(source) if isinstance(source, list) else source)
-        return (json.dumps(data, ensure_ascii=False, indent=4),)
+        return io.NodeOutput(json.dumps(data, ensure_ascii=False, indent=4))
 
 
 def _convert_value(value, output_type):
@@ -152,24 +152,25 @@ def _convert_value(value, output_type):
     return value
 
 
-class XiJsonGetValue:
+class XiJsonGetValue(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "json_text": ("STRING", {"default": "", "multiline": True}),
-                "key_path": ("STRING", {"default": "", "multiline": False}),
-                "output_type": (["auto", "string", "int", "float", "boolean", "json"], {"default": "auto"}),
-            },
-        }
+    def define_schema(cls):
+        return io.Schema(
+            node_id="XiJsonGetValue",
+            display_name="Get JSON Value",
+            category="XiNodes",
+            description="按 '-' 分割的键路径提取 JSON 对象中的字段值，例如：分镜-0-分镜01。output_type 控制输出值的类型转换（auto 保持原样），转换失败会报错。",
+            inputs=[
+                io.String.Input("json_text", default="", multiline=True, tooltip="JSON 对象文本。"),
+                io.String.Input("key_path", default="", tooltip="以 '-' 分隔的键路径，列表用数字索引，例如：分镜-0-分镜01。"),
+                io.Combo.Input("output_type", options=["auto", "string", "int", "float", "boolean", "json"],
+                               default="auto", tooltip="输出类型转换方式，auto 保持原样；转换失败会报错而不是静默降级。"),
+            ],
+            outputs=[io.AnyType.Output(display_name="value")],
+        )
 
-    RETURN_TYPES = ("*",)
-    RETURN_NAMES = ("value",)
-    FUNCTION = "get_value"
-    CATEGORY = "XiNodes"
-    DESCRIPTION = "按 '-' 分割的键路径提取 JSON 对象中的字段值，例如：分镜-0-分镜01。output_type 控制输出值的类型转换（auto 保持原样），转换失败会报错。"
-
-    def get_value(self, json_text, key_path, output_type="auto"):
+    @classmethod
+    def execute(cls, json_text, key_path, output_type="auto"):
         data = _parse_json_object(json_text, "输入 json_text")
 
         path_str = str(key_path).strip()
@@ -196,25 +197,25 @@ class XiJsonGetValue:
             else:
                 raise TypeError(f"[XiNodes] '{location}' 处的值是 {type(current).__name__}，无法继续向下提取 '{part}'。当前值：{current}")
 
-        return (_convert_value(current, output_type),)
+        return io.NodeOutput(_convert_value(current, output_type))
 
 
-class XiJsonFormat:
+class XiJsonFormat(io.ComfyNode):
     @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "json_text": ("STRING", {"default": "", "multiline": True}),
-            },
-        }
+    def define_schema(cls):
+        return io.Schema(
+            node_id="XiJsonFormat",
+            display_name="Format JSON",
+            category="XiNodes",
+            description="将符合 JSON 格式的输入校验并标准化为双引号、缩进格式的 JSON 字符串。也兼容 Python 风格（单引号、True/False/None）的文本。需要连线时可将文本框右键转为输入口。",
+            inputs=[
+                io.String.Input("json_text", default="", multiline=True, tooltip="待格式化的 JSON 或 Python 字面量文本。"),
+            ],
+            outputs=[io.String.Output(display_name="json")],
+        )
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("json",)
-    FUNCTION = "format_json"
-    CATEGORY = "XiNodes"
-    DESCRIPTION = "将符合 JSON 格式的输入校验并标准化为双引号、缩进格式的 JSON 字符串。也兼容 Python 风格（单引号、True/False/None）的文本。需要连线时可将文本框右键转为输入口。"
-
-    def format_json(self, json_text):
+    @classmethod
+    def execute(cls, json_text):
         text = str(json_text).strip()
         if not text:
             raise ValueError("[XiNodes] 输入不能为空，请提供 JSON 格式的文本。")
@@ -228,19 +229,9 @@ class XiJsonFormat:
                 raise ValueError(f"[XiNodes] 输入不是合法的 JSON（也不是可转换的 Python 字面量）：{e}")
 
         try:
-            return (json.dumps(data, ensure_ascii=False, indent=4),)
+            return io.NodeOutput(json.dumps(data, ensure_ascii=False, indent=4))
         except (TypeError, ValueError) as e:
             raise ValueError(f"[XiNodes] 内容无法序列化为 JSON：{e}")
 
 
-NODE_CLASS_MAPPINGS = {
-    "XiJsonCreate": XiJsonCreate,
-    "XiJsonGetValue": XiJsonGetValue,
-    "XiJsonFormat": XiJsonFormat,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "XiJsonCreate": "Create JSON Object",
-    "XiJsonGetValue": "Get JSON Value",
-    "XiJsonFormat": "Format JSON",
-}
+NODES = [XiJsonCreate, XiJsonGetValue, XiJsonFormat]

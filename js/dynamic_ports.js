@@ -1,126 +1,161 @@
 import { app } from "../../scripts/app.js";
 
+/**
+ * XiMultiFolderImageLoader - show only the first `folder_count` folder_N widgets.
+ *
+ * 为什么不再从 this.widgets 里剔除控件
+ * -----------------------------------
+ * 前端把图序列化成 prompt 时是**实时**读取控件数组的：
+ *
+ *     // ExecutableNodeDTO
+ *     get widgets() { return this.node.widgets }
+ *
+ *     // graphToPrompt()
+ *     let { widgets: n } = e;
+ *     for (let [r, i] of n.entries()) {
+ *         if (!i.name || i.options.serialize === false) continue;
+ *         t[i.name] = ...i.value;              // 只有这两种情况会被跳过
+ *     }
+ *
+ * 所以一旦把 widget 从数组里摘掉，它的值就不会进 prompt；而 folder_4..folder_10
+ * 在 object_info 里是 required，后端 execution.validate_prompt() 会直接拒绝排队：
+ *
+ *     Required input is missing: folder_4 ... folder_10
+ *
+ * 现在改用前端自己的可见性开关（widget.hidden），它只影响绘制与布局：
+ *
+ *     deriveWidgetVisibility(w) -> suppression.byExtension = w.hidden
+ *     occupiesCanvasRow()       -> byExtension ? false   // 不占行高
+ *     isWidgetVisibleOnSurface()-> byExtension ? false   // 不绘制、不进面板列表
+ *
+ * widget 始终留在 node.widgets 里，值照常序列化。
+ */
+
+const NODE_NAME = "XiMultiFolderImageLoader";
+const FOLDER_SLOTS = 10;
+
+/** 读取前端可见性记录（若已解析过），否则回落到 widget.hidden。 */
+function setHidden(widget, hidden) {
+  if (!widget) return;
+  widget.hidden = hidden;
+  widget.options = widget.options || {};
+  widget.options.hidden = hidden;
+  // 前端可能已经缓存了 visibility 对象，保持同步以免读到旧值。
+  if (widget.visibility && widget.visibility.suppression) {
+    widget.visibility.suppression.byExtension = hidden;
+  }
+}
+
+/** folder_N 的序号；folder_count 不是端口，返回 null。 */
+function slotIndex(name) {
+  const m = /^folder_(\d+)$/.exec(name || "");
+  return m ? parseInt(m[1], 10) : null;
+}
+
 app.registerExtension({
-    name: "XiNodes.MultiFolderDynamicUI",
-    async beforeRegisterNodeDef(nodeType, nodeData, app) {
-        if (nodeData.name === "XiMultiFolderImageLoader") {
+  name: "XiNodes.MultiFolderDynamicUI",
 
-            const onNodeCreated = nodeType.prototype.onNodeCreated;
-            nodeType.prototype.onNodeCreated = function () {
-                const result = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
-                
-                this.updateDynUI = function() {
-                    try {
-                        if (!this.widgets || !this.outputs) return;
-                        
-                        // 首次运行该函数时，在尚未发生破坏前立刻缓存所有的组件结构副本
-                        if (!this._full_widgets_cache) {
-                            this._full_widgets_cache = [...this.widgets];
-                        }
-                        
-                        const cntWidget = this.widgets.find(w => w.name === "folder_count") || this._full_widgets_cache.find(w => w.name === "folder_count");
-                        if (!cntWidget) return;
-                        
-                        let count = parseInt(cntWidget.value || 3, 10);
-                        if (count < 1) count = 1;
-                        if (count > 10) count = 10;
-                        
-                        // 1. 完全剔除隐去多余选项，通过映射我们当初的全缓存内存进行切段来重新装填到展示名单
-                        this.widgets = this._full_widgets_cache.filter(w => {
-                            if (w.name && w.name.startsWith("folder_")) {
-                                const num = parseInt(w.name.split("_")[1]);
-                                if (!isNaN(num)) {
-                                    return num <= count;
-                                }
-                            }
-                            return true;
-                        });
+  async beforeRegisterNodeDef(nodeType, nodeData) {
+    if (nodeData.name !== NODE_NAME) return;
 
-                        // 2. 动态调节 Outputs 的插槽群
-                        const fnIndex = this.outputs.findIndex(o => o.name === "FILENAME");
-                        if (fnIndex !== -1) {
-                            const fnOutputObj = this.outputs[fnIndex];
-                            
-                            // 先将其暂且安全地抽取离港
-                            this.outputs.splice(fnIndex, 1);
-                            
-                            let currentCount = Math.floor(this.outputs.length / 2);
+    const onNodeCreated = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function () {
+      const result = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
 
-                            // 进行原生端点伸展
-                            if (currentCount < count) {
-                                for (let i = currentCount + 1; i <= count; i++) {
-                                    this.addOutput("IMAGE_" + i, "IMAGE");
-                                    this.addOutput("FILE_PATH_" + i, "STRING");
-                                }
-                            } else if (currentCount > count) {
-                                // 极其原生的收缩剔除与斩断残留虚线
-                                for (let i = currentCount * 2 - 1; i >= count * 2; i--) {
-                                    this.removeOutput(i);
-                                }
-                            }
-                            
-                            // 最终保证将唯一的 FILENAME 退还原位至最底部
-                            this.outputs.push(fnOutputObj);
-                        }
-                        
-                        if (this.computeSize) {
-                             const size = this.computeSize();
-                             // 取用最大值保证如果不小心比必要尺寸小依然能撑开，但如果用户已经拉到极其宽的尺寸了，将全盘保留不做还原缩小！
-                             this.size[0] = Math.max(this.size[0], size[0]);
-                             this.size[1] = size[1];
-                        }
-                        
-                        this.setDirtyCanvas(true, true);
+      this.updateDynUI = function () {
+        try {
+          if (!this.widgets) return;
 
-                    } catch (e) {
-                         console.error("[XiNodes DynamicUI Error]", e);
-                    }
+          const cntWidget = this.widgets.find(w => w.name === "folder_count");
+          if (!cntWidget) return;
+
+          let count = Number(cntWidget.value);
+          if (!Number.isFinite(count)) count = 3;
+          count = Math.min(FOLDER_SLOTS, Math.max(1, Math.round(count)));
+
+          // 1. 控件只隐藏，不移除 —— 保证 folder_N 的值仍然进入 prompt
+          for (const w of this.widgets) {
+            const idx = slotIndex(w.name);
+            if (idx !== null) setHidden(w, idx > count);
+          }
+
+          // 2. 输出插槽群仍按 count 伸缩（端口没有"值要序列化"的问题）
+          if (this.outputs) {
+            const fnIndex = this.outputs.findIndex(o => o.name === "FILENAME");
+            if (fnIndex !== -1) {
+              const fnOutputObj = this.outputs.splice(fnIndex, 1)[0];
+
+              let currentCount = Math.floor(this.outputs.length / 2);
+              if (currentCount < count) {
+                for (let i = currentCount + 1; i <= count; i++) {
+                  this.addOutput("IMAGE_" + i, "IMAGE");
+                  this.addOutput("FILE_PATH_" + i, "STRING");
                 }
-                
-                // 将最后执行的状态打上时间戳或值记忆
-                this._last_dyn_count = -1;
-
-                // 首次在构造完毕的滞后阶段做一次强梳理，这也是使得用户刚拿出来或刚刷新网页时只有1~3个端点的触发功臣。
-                setTimeout(() => {
-                     const cntWidget = this.widgets.find(w => w.name === "folder_count");
-                     if (cntWidget) {
-                         this._last_dyn_count = parseInt(cntWidget.value || 3, 10);
-                     }
-                     this.updateDynUI();
-                }, 100);
-
-                return result;
-            }
-            
-            // 【核武器级手段！无死角拦截】不采用任何极其脆弱的基于 callback 或钩子的事件订阅，因为在其他复杂插件介入后随时可能导致脱钩
-            // 取而代之我们使用引擎底层画图管线作为心跳发生器。只要用户拉动了进度条，它必然会调用 onDraw，此时对比出不同后便立即触发送往重构模块！
-            const onDrawForeground = nodeType.prototype.onDrawForeground;
-            nodeType.prototype.onDrawForeground = function (ctx) {
-                const result = onDrawForeground ? onDrawForeground.apply(this, arguments) : undefined;
-                
-                if (this.widgets && this._full_widgets_cache) {
-                    const cntWidget = this.widgets.find(w => w.name === "folder_count") || this._full_widgets_cache.find(w => w.name === "folder_count");
-                    if (cntWidget) {
-                        let currentCount = parseInt(cntWidget.value || 3, 10);
-                        if (this._last_dyn_count !== currentCount) {
-                            this._last_dyn_count = currentCount;
-                            if (this.updateDynUI) {
-                                this.updateDynUI();
-                            }
-                        }
-                    }
+              } else if (currentCount > count) {
+                for (let i = currentCount * 2 - 1; i >= count * 2; i--) {
+                  this.removeOutput(i);
                 }
-                return result;
+              }
+
+              // FILENAME 始终留在最底部
+              this.outputs.push(fnOutputObj);
             }
-            
-            const onConfigure = nodeType.prototype.onConfigure;
-            nodeType.prototype.onConfigure = function () {
-                const result = onConfigure ? onConfigure.apply(this, arguments) : undefined;
-                if(this.updateDynUI) {
-                     this.updateDynUI();
-                }
-                return result;
-            }
+          }
+
+          if (this.computeSize) {
+            const size = this.computeSize();
+            // 只撑大不缩小，避免覆盖用户手动拉宽的尺寸
+            this.size[0] = Math.max(this.size[0], size[0]);
+            this.size[1] = size[1];
+          }
+
+          this.setDirtyCanvas(true, true);
+        } catch (e) {
+          console.error("[XiNodes DynamicUI Error]", e);
         }
-    }
+      };
+
+      this._last_dyn_count = -1;
+
+      // 新建/刷新后先梳理一次（默认 folder_count=3，只露出 folder_1..3）
+      setTimeout(() => {
+        const cntWidget = this.widgets && this.widgets.find(w => w.name === "folder_count");
+        if (cntWidget) {
+          const v = Number(cntWidget.value);
+          this._last_dyn_count = Number.isFinite(v) ? Math.round(v) : 3;
+        }
+        this.updateDynUI();
+      }, 100);
+
+      return result;
+    };
+
+    // 沿用原作者的做法：用绘制心跳检测 folder_count 变化，
+    // 比订阅 callback/事件更不容易被其它插件脱钩。
+    const onDrawForeground = nodeType.prototype.onDrawForeground;
+    nodeType.prototype.onDrawForeground = function (ctx) {
+      const result = onDrawForeground ? onDrawForeground.apply(this, arguments) : undefined;
+
+      if (this.widgets && this.updateDynUI) {
+        const cntWidget = this.widgets.find(w => w.name === "folder_count");
+        if (cntWidget) {
+          let currentCount = Number(cntWidget.value);
+          if (!Number.isFinite(currentCount)) currentCount = 3;
+          currentCount = Math.round(currentCount);
+          if (this._last_dyn_count !== currentCount) {
+            this._last_dyn_count = currentCount;
+            this.updateDynUI();
+          }
+        }
+      }
+      return result;
+    };
+
+    const onConfigure = nodeType.prototype.onConfigure;
+    nodeType.prototype.onConfigure = function () {
+      const result = onConfigure ? onConfigure.apply(this, arguments) : undefined;
+      if (this.updateDynUI) this.updateDynUI();
+      return result;
+    };
+  },
 });
