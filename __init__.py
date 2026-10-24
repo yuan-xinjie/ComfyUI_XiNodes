@@ -22,6 +22,7 @@ try:
         image_loader_node,
         json_node,
         save_text_node,
+        transnetv2_shot_split_node,
     )
 except ImportError:  # loaded as loose modules rather than as a package
     import audio_save_node  # type: ignore[no-redef]
@@ -31,6 +32,7 @@ except ImportError:  # loaded as loose modules rather than as a package
     import image_loader_node  # type: ignore[no-redef]
     import json_node  # type: ignore[no-redef]
     import save_text_node  # type: ignore[no-redef]
+    import transnetv2_shot_split_node  # type: ignore[no-redef]
 
 WEB_DIRECTORY = "./js"
 
@@ -42,6 +44,7 @@ _MODULES = (
     gemini_api_node,
     audio_save_node,
     batch_images_node,
+    transnetv2_shot_split_node,
 )
 
 NODES: list[type[io.ComfyNode]] = []
