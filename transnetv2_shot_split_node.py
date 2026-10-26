@@ -882,36 +882,35 @@ def _fixed_duration_rows(
     return rows
 
 
-def _merge_short_shots(rows, short_sec=3.0, max_sec=6.0):
-    """Merge short shots into neighbours without exceeding ``max_sec``.
+def _merge_shots(rows, max_sec=6.0):
+    """Greedily merge consecutive shots while the total stays within ``max_sec``.
 
-    A shot (or a group already built from several shots) with
-    ``duration <= short_sec`` is merged with the **next** contiguous group when
-    the sum fits, otherwise with the **previous** one.  When neither neighbour
-    fits, the shot is left as-is instead of dropping frames.  The scan repeats
-    so several short shots can chain into one longer segment, and stops when no
-    further merge is possible.
+    There is no separate "short shot" threshold: every shot is a candidate.
+    The scan runs left to right and keeps appending the next contiguous shot to
+    the current group while the accumulated duration does not exceed
+    ``max_sec``.  When adding the next shot would exceed the limit, the current
+    group is emitted and a new group starts with that shot.
 
-    ``short_sec <= 0`` or ``max_sec <= 0`` disables merging entirely.  Only
-    frame-contiguous rows are merged, which also keeps this safe when
-    ``drop_transition_frames`` left gaps between shots.
+    A shot whose own duration is already greater than ``max_sec`` is never
+    merged; it is emitted untouched and also acts as a barrier between its
+    neighbours.  ``max_sec <= 0`` disables merging.  Only frame-contiguous rows
+    are merged, which keeps this safe when ``drop_transition_frames`` left gaps.
 
     Returns ``(merged_rows, merge_operations)``.
     """
-    if short_sec is None or max_sec is None or short_sec <= 0 or max_sec <= 0:
-        return rows, 0
-    if len(rows) < 2:
+    if max_sec is None or max_sec <= 0 or len(rows) < 2:
         return rows, 0
 
     eps = 1e-9
-    groups = [dict(row, merged_shots=int(row.get("merged_shots", 1))) for row in rows]
+    groups = []
+    current = None
     merge_operations = 0
 
     def contiguous(left, right):
         return int(left["end_frame"]) + 1 == int(right["start_frame"])
 
     def merge_pair(left, right):
-        merged = {
+        return {
             "shot_id": left["shot_id"],
             "start_frame": int(left["start_frame"]),
             "end_frame": int(right["end_frame"]),
@@ -922,42 +921,30 @@ def _merge_short_shots(rows, short_sec=3.0, max_sec=6.0):
             "boundary_score": left["boundary_score"],
             "merged_shots": int(left["merged_shots"]) + int(right["merged_shots"]),
         }
-        return merged
 
-    while True:
-        merged_any = False
-        for index, group in enumerate(groups):
-            if float(group["duration"]) > short_sec + eps:
+    for row in rows:
+        row = dict(row, merged_shots=int(row.get("merged_shots", 1)))
+        if current is not None:
+            fits = (
+                contiguous(current, row)
+                and float(current["duration"]) + float(row["duration"])
+                <= max_sec + eps
+            )
+            if fits:
+                current = merge_pair(current, row)
+                merge_operations += 1
                 continue
+            groups.append(current)
+            current = None
 
-            left_index = right_index = None
-            if index + 1 < len(groups):
-                nxt = groups[index + 1]
-                if (
-                    contiguous(group, nxt)
-                    and float(group["duration"]) + float(nxt["duration"])
-                    <= max_sec + eps
-                ):
-                    left_index, right_index = index, index + 1
-            if left_index is None and index > 0:
-                prev = groups[index - 1]
-                if (
-                    contiguous(prev, group)
-                    and float(prev["duration"]) + float(group["duration"])
-                    <= max_sec + eps
-                ):
-                    left_index, right_index = index - 1, index
-            if left_index is None:
-                continue
+        if float(row["duration"]) > max_sec + eps:
+            # Too long on its own: keep it as-is and do not merge across it.
+            groups.append(row)
+        else:
+            current = row
 
-            merged = merge_pair(groups[left_index], groups[right_index])
-            groups[left_index : right_index + 1] = [merged]
-            merge_operations += 1
-            merged_any = True
-            break
-
-        if not merged_any:
-            break
+    if current is not None:
+        groups.append(current)
 
     for index, row in enumerate(groups, start=1):
         row["shot_id"] = index
@@ -987,7 +974,7 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
             description=(
                 "流式解码 VIDEO 并按镜头分段，只有 videos 输出。"
                 "split_mode 可切换两种方式：分镜 = 模型检测镜头"
-                "（阈值、权重、短段合并等参数）；时长 = 按固定秒数切分"
+                "（阈值、权重、最大合并时长等参数）；时长 = 按固定秒数切分"
                 "（segment_sec，最后不足一段的余量也会保留）。"
                 "videos 使用懒加载裁剪，接 Save Video 可一次导出全部分段。"
             ),
@@ -1080,18 +1067,6 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
                                     ),
                                 ),
                                 io.Float.Input(
-                                    "merge_short_sec",
-                                    optional=True,
-                                    default=3.0,
-                                    min=0.0,
-                                    max=3600.0,
-                                    step=0.1,
-                                    tooltip=(
-                                        "短镜头阈值：时长 ≤ 此值的分段会尝试和相邻分段拼接。"
-                                        "0 = 不拼接；默认 3 秒。"
-                                    ),
-                                ),
-                                io.Float.Input(
                                     "merge_max_sec",
                                     optional=True,
                                     default=6.0,
@@ -1099,9 +1074,10 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
                                     max=3600.0,
                                     step=0.1,
                                     tooltip=(
-                                        "拼接后的时长上限：与相邻段相加超过此值就放弃这次拼接；"
-                                        "多个短段可以在不超过此值的前提下继续合并。"
-                                        "0 = 不拼接；默认 6 秒。"
+                                        "合并后的最大时长（秒）。相邻分段会连续合并，"
+                                        "累计不超过此值；再加下一段会超过就停止，"
+                                        "从下一段重新开始。单段自身超过此值时不参与合并。"
+                                        "0 = 不合并；默认 6 秒。"
                                     ),
                                 ),
                             ],
@@ -1171,7 +1147,7 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
                 io.Int.Output(
                     "shot_count",
                     display_name="shot_count",
-                    tooltip="输出分段数量；开启短段合并后可能少于检测到的镜头数。",
+                    tooltip="输出分段数量；开启合并后可能少于检测到的镜头数。",
                 ),
                 io.String.Output(
                     "video_name",
@@ -1261,11 +1237,6 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
             drop_transition_frames = bool(
                 values.get("drop_transition_frames", False)
             )
-            merge_short_sec = (
-                3.0
-                if values.get("merge_short_sec") is None
-                else max(0.0, float(values.get("merge_short_sec")))
-            )
             merge_max_sec = (
                 6.0
                 if values.get("merge_max_sec") is None
@@ -1283,7 +1254,6 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
             threshold = None
             device = "auto"
             drop_transition_frames = False
-            merge_short_sec = 0.0
             merge_max_sec = 0.0
 
         resolved_video_path = _resolve_video_path(video_path)
@@ -1376,9 +1346,7 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
                         row["end_time"] = end_ts
                     row["duration"] = row["end_time"] - row["start_time"]
             detected_count = len(rows)
-            rows, merge_operations = _merge_short_shots(
-                rows, merge_short_sec, merge_max_sec
-            )
+            rows, merge_operations = _merge_shots(rows, merge_max_sec)
             weights_label = (
                 os.path.basename(weights_path)
                 if weights_path is not None
@@ -1506,7 +1474,6 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
                 round(segment_sec, 3) if segment_sec is not None else None
             ),
             "drop_transition_frames": drop_flag,
-            "merge_short_sec": round(merge_short_sec, 3),
             "merge_max_sec": round(merge_max_sec, 3),
             "merge_operations": merge_operations,
             "video_path": resolved_video_path or "",
