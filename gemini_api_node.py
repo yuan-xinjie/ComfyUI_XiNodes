@@ -9,7 +9,7 @@ from PIL import Image
 from google import genai
 from google.genai import types
 
-from comfy_api.latest import io
+from comfy_api.latest import io as comfy_io
 
 def tensor_to_pil(tensor_img, max_dim=1536):
     if len(tensor_img.shape) == 4:
@@ -113,44 +113,44 @@ def sanitize_and_trim_history(history_list):
 # ==========================================
 # Google GenAI 官方 SDK 驱动节点 (Gemini API Node)
 # ==========================================
-class XiGeminiAPI(io.ComfyNode):
+class XiGeminiAPI(comfy_io.ComfyNode):
     @classmethod
     def define_schema(cls):
-        return io.Schema(
+        return comfy_io.Schema(
             node_id="XiGeminiAPI",
             display_name="Gemini API",
             category="XiNodes",
             is_output_node=True,
             description="google-genai 协议的 API 节点，可用于 chat 和 image，自定义 url、key、model、生图比例与分辨率，最多输入三张图，输出图像或文本。",
             inputs=[
-                io.String.Input("base_url", default="https://generativelanguage.googleapis.com",
+                comfy_io.String.Input("base_url", default="https://generativelanguage.googleapis.com",
                                 tooltip="API 基地址；留空使用 Google 官方端点。非 /v1、/v1beta 结尾时自动按 v1beta 处理。"),
-                io.String.Input("api_key", default="", tooltip="API Key，留空则走默认凭据。"),
-                io.String.Input("model", default="gemini-3.1-flash-image", tooltip="模型名称。"),
-                io.Combo.Input("mode", options=["image", "chat", "auto"], default="image",
+                comfy_io.String.Input("api_key", default="", tooltip="API Key，留空则走默认凭据。"),
+                comfy_io.String.Input("model", default="gemini-3.1-flash-image", tooltip="模型名称。"),
+                comfy_io.Combo.Input("mode", options=["image", "chat", "auto"], default="image",
                                tooltip="image 强制出图，chat 只要文本，auto 由模型决定。"),
-                io.String.Input("system_prompt", default="", multiline=True, tooltip="系统提示词。"),
-                io.String.Input("user_prompt", default="", multiline=True, tooltip="用户提示词。"),
-                io.Combo.Input("aspect_ratio",
+                comfy_io.String.Input("system_prompt", default="", multiline=True, tooltip="系统提示词。"),
+                comfy_io.String.Input("user_prompt", default="", multiline=True, tooltip="用户提示词。"),
+                comfy_io.Combo.Input("aspect_ratio",
                                options=["Auto", "1:1", "3:4", "4:3", "9:16", "16:9", "2:3", "3:2", "4:5", "5:4", "21:9"],
                                default="Auto", tooltip="Auto 时按首张输入图自动选取最接近的比例。"),
-                io.Combo.Input("resolution", options=["Auto", "512", "1K", "2K", "4K"], default="1K",
+                comfy_io.Combo.Input("resolution", options=["Auto", "512", "1K", "2K", "4K"], default="1K",
                                tooltip="目标输出分辨率。2K/4K 使用原生高分辨率模式。"),
-                io.Combo.Input("context_memory", options=["enable", "disable"], default="enable",
+                comfy_io.Combo.Input("context_memory", options=["enable", "disable"], default="enable",
                                tooltip="enable 时按 model+url 维护会话上下文（上限 512KB）。"),
-                io.Boolean.Input("clear_history", default=False, tooltip="勾选后本次调用前清空该会话的上下文。"),
-                io.Combo.Input("multi_image_mode", options=["process_separately", "combine_in_one_prompt"],
+                comfy_io.Boolean.Input("clear_history", default=False, tooltip="勾选后本次调用前清空该会话的上下文。"),
+                comfy_io.Combo.Input("multi_image_mode", options=["process_separately", "combine_in_one_prompt"],
                                default="process_separately", tooltip="多张输入图是分别请求，还是合并进同一个 prompt。"),
-                io.Float.Input("temperature", default=1.0, min=0.0, max=2.0, step=0.01, tooltip="采样温度。"),
-                io.Int.Input("seed", default=-1, min=-1, max=2147483647, tooltip="-1 表示随机。"),
-                io.Int.Input("timeout", default=180, min=1, max=3600, step=1, tooltip="请求超时（秒）。"),
-                io.Image.Input("image_1", optional=True, tooltip="参考图 1（批次会逐张展开）。"),
-                io.Image.Input("image_2", optional=True, tooltip="参考图 2。"),
-                io.Image.Input("image_3", optional=True, tooltip="参考图 3。"),
+                comfy_io.Float.Input("temperature", default=1.0, min=0.0, max=2.0, step=0.01, tooltip="采样温度。"),
+                comfy_io.Int.Input("seed", default=-1, min=-1, max=2147483647, tooltip="-1 表示随机。"),
+                comfy_io.Int.Input("timeout", default=180, min=1, max=3600, step=1, tooltip="请求超时（秒）。"),
+                comfy_io.Image.Input("image_1", optional=True, tooltip="参考图 1（批次会逐张展开）。"),
+                comfy_io.Image.Input("image_2", optional=True, tooltip="参考图 2。"),
+                comfy_io.Image.Input("image_3", optional=True, tooltip="参考图 3。"),
             ],
             outputs=[
-                io.Image.Output(display_name="image"),
-                io.String.Output(display_name="text"),
+                comfy_io.Image.Output(display_name="image"),
+                comfy_io.String.Output(display_name="text"),
             ],
         )
 
@@ -362,6 +362,6 @@ class XiGeminiAPI(io.ComfyNode):
             raw_text_str = "\n".join(all_output_texts) if all_output_texts else ""
             out_text = clean_text_media_references(raw_text_str)
 
-        return io.NodeOutput(out_image_tensor, out_text, ui={"text": [out_text if out_text else ""]})
+        return comfy_io.NodeOutput(out_image_tensor, out_text, ui={"text": [out_text if out_text else ""]})
 
 NODES = [XiGeminiAPI]
