@@ -15,6 +15,9 @@ Design notes
   48x27 ring buffer plus one probability per frame, and returns lazily trimmed
   VIDEO segments.  It intentionally has no IMAGE output, because producing
   frames necessarily materialises them.
+* `分镜` mode also has `max_shot_sec`: after merging, any segment longer than
+  that many seconds is cut again on frame boundaries, so the pieces stay in
+  source order and their frame counts (and durations) add up to the parent.
 * `videos` is a list output.  ComfyUI runs downstream nodes once per list item,
   so a single Save Video exports every segment in one queue run.
 * Inference is windowed exactly like transnetv2-pytorch's own predict_frames
@@ -27,7 +30,7 @@ import json
 import os
 import random
 import threading
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from collections import OrderedDict
 from contextlib import contextmanager
 from fractions import Fraction
@@ -736,6 +739,9 @@ def _write_csv(rows, meta):
         "seed",
         "split_mode",
         "segment_sec",
+        "max_shot_sec",
+        "split_part",
+        "split_parts",
     ]
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -774,6 +780,13 @@ def _write_csv(rows, meta):
                         if meta.get("segment_sec") is None
                         else "{:g}".format(meta["segment_sec"])
                     ),
+                    "max_shot_sec": (
+                        ""
+                        if meta.get("max_shot_sec") is None
+                        else "{:g}".format(meta["max_shot_sec"])
+                    ),
+                    "split_part": int(row.get("split_part", 1)),
+                    "split_parts": int(row.get("split_parts", 1)),
                 }
             )
     return csv_path
@@ -951,6 +964,144 @@ def _merge_shots(rows, max_sec=6.0):
     return groups, merge_operations
 
 
+def _split_bounds(start, end, max_sec, fps_value, timestamps, row_end_time=None):
+    """Return half-open piece boundaries ``[start, ..., end]`` for one row.
+
+    With real ``timestamps`` (VFR/streaming) a piece ends right before the first
+    frame that would make it exceed ``max_sec``; the last frame that still fits
+    is handed to the next piece, so every non-remainder piece stays within the
+    limit at frame granularity.  Without timestamps the row is cut into
+    ``max(1, int(max_sec * fps))`` frame chunks, the same rule in frame units.
+
+    A row that ends on the last frame of the video is special: its end time is
+    the container duration, which is usually a little past the last frame
+    start.  If folding the last frame into the remainder would push that piece
+    over ``max_sec``, the last frame is kept as its own (1-frame) piece instead.
+    """
+    if timestamps is None:
+        # +1e-9 absorbs float error in e.g. 1.15 * 20 = 22.999999999999996;
+        # it is far below one frame, so the piece still stays within max_sec.
+        step = max(1, int(max_sec * fps_value + 1e-9))
+        return list(range(start, end, step)) + [end]
+
+    total_frames = len(timestamps)
+    bounds = [start]
+    cursor = start
+    while cursor < end:
+        # +1e-9 keeps a frame whose timestamp equals the window boundary from
+        # being dropped by 1-ulp float error (e.g. 61/24 + 2.5 vs 121/24).
+        target = float(timestamps[cursor]) + max_sec + 1e-9
+        # Index ``end`` is included when it exists (it is the start time of the
+        # next row) so the timestamps that close this row are not ignored.
+        hi = end + 1 if end < total_frames else end
+        over = bisect_right(timestamps, target, cursor + 1, hi)
+        if over >= hi:
+            # Every remaining frame starts inside the window: keep the rest.
+            piece_end = end
+            if (
+                end == total_frames
+                and row_end_time is not None
+                and end - cursor > 1
+                and float(row_end_time) - float(timestamps[cursor])
+                > max_sec + 1e-9
+            ):
+                # The container duration extends past the last frame start;
+                # folding that frame in would exceed the limit.  Hand it to a
+                # new piece instead (cannot be smaller than one frame).
+                piece_end = end - 1
+        else:
+            # ``over`` is the first frame that no longer fits; give it to the
+            # next piece so this piece's duration stays <= max_sec.
+            piece_end = over - 1
+        if piece_end <= cursor:
+            piece_end = cursor + 1
+        bounds.append(piece_end)
+        cursor = piece_end
+    return bounds
+
+
+def _split_long_shots(rows, max_sec, fps_value, timestamps=None):
+    """Cut rows longer than ``max_sec`` into ordered, frame-contiguous pieces.
+
+    Pieces are addressed by frame index and share the same source: no frame is
+    dropped or duplicated, the order is unchanged, and ``sum(frame_count)`` /
+    ``sum(duration)`` of the pieces equal the parent row.  Each piece carries
+    ``split_part`` (1-based) and ``split_parts`` (number of pieces the parent
+    became).  Only the first piece keeps the parent's ``boundary_score``: the
+    later pieces start at an artificial cut, not at a detected shot boundary.
+
+    ``split_operations`` counts the pieces a split added (a row cut in three
+    contributes two).  ``max_sec <= 0`` disables splitting.  Returns
+    ``(rows, split_operations)``.
+    """
+    if max_sec is None or max_sec <= 0 or not rows:
+        return rows, 0
+
+    max_sec = float(max_sec)
+    fps_value = max(float(fps_value), 1e-6)
+    eps = 1e-9
+    pieces = []
+    split_operations = 0
+
+    for row in rows:
+        row = dict(row)
+        if float(row["duration"]) <= max_sec + eps:
+            row["split_part"] = 1
+            row["split_parts"] = 1
+            pieces.append(row)
+            continue
+
+        start = int(row["start_frame"])
+        end = int(row["end_frame"]) + 1
+        bounds = _split_bounds(
+            start,
+            end,
+            max_sec,
+            fps_value,
+            timestamps,
+            row.get("end_time"),
+        )
+        if len(bounds) < 2:
+            # A single frame cannot be cut any further.
+            row["split_part"] = 1
+            row["split_parts"] = 1
+            pieces.append(row)
+            continue
+
+        split_parts = len(bounds) - 1
+        split_operations += split_parts - 1
+        for part_index in range(split_parts):
+            part_start = bounds[part_index]
+            part_end = bounds[part_index + 1]
+            if timestamps is not None:
+                start_ts = float(timestamps[part_start])
+                if part_end < len(timestamps):
+                    end_ts = float(timestamps[part_end])
+                else:
+                    end_ts = float(row["end_time"])
+            else:
+                start_ts = part_start / fps_value
+                end_ts = part_end / fps_value
+            if end_ts <= start_ts:
+                end_ts = start_ts + 1.0 / fps_value
+            piece = dict(row)
+            piece["start_frame"] = part_start
+            piece["end_frame"] = part_end - 1
+            piece["frame_count"] = part_end - part_start
+            piece["start_time"] = start_ts
+            piece["end_time"] = end_ts
+            piece["duration"] = end_ts - start_ts
+            piece["split_part"] = part_index + 1
+            piece["split_parts"] = split_parts
+            if part_index > 0:
+                piece["boundary_score"] = None
+            pieces.append(piece)
+
+    for index, row in enumerate(pieces, start=1):
+        row["shot_id"] = index
+    return pieces, split_operations
+
+
 # --------------------------------------------------------------------------- #
 # node
 # --------------------------------------------------------------------------- #
@@ -958,10 +1109,11 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
     """Video-only splitter with ``分镜`` and ``时长`` modes.
 
     ``分镜`` decodes once at 48x27, keeps only a 100-frame ring buffer plus
-    per-frame probabilities, and returns lazily trimmed VIDEO segments.
-    ``时长`` never loads the model and only needs frame timestamps.  Both
-    modes deliberately have no IMAGE output so the node can never accidentally
-    materialise every frame.
+    per-frame probabilities, and returns lazily trimmed VIDEO segments.  After
+    optional merging, ``max_shot_sec`` cuts any still-too-long segment into
+    ordered, frame-contiguous pieces.  ``时长`` never loads the model and only
+    needs frame timestamps.  Both modes deliberately have no IMAGE output so
+    the node can never accidentally materialise every frame.
     """
 
     @classmethod
@@ -974,7 +1126,7 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
             description=(
                 "流式解码 VIDEO 并按镜头分段，只有 videos 输出。"
                 "split_mode 可切换两种方式：分镜 = 模型检测镜头"
-                "（阈值、权重、最大合并时长等参数）；时长 = 按固定秒数切分"
+                "（阈值、权重、最大合并时长、最长分段等参数）；时长 = 按固定秒数切分"
                 "（segment_sec，最后不足一段的余量也会保留）。"
                 "videos 使用懒加载裁剪，接 Save Video 可一次导出全部分段。"
             ),
@@ -987,6 +1139,8 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
                 "segment by time",
                 "transnet",
                 "long video",
+                "max shot",
+                "最长分镜",
                 "分镜",
                 "镜头切割",
                 "固定时长",
@@ -1078,6 +1232,25 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
                                         "累计不超过此值；再加下一段会超过就停止，"
                                         "从下一段重新开始。单段自身超过此值时不参与合并。"
                                         "0 = 不合并；默认 6 秒。"
+                                        "合并后仍超过 max_shot_sec 的分段会再被切开。"
+                                    ),
+                                ),
+                                io.Float.Input(
+                                    "max_shot_sec",
+                                    optional=True,
+                                    default=0.0,
+                                    min=0.0,
+                                    max=3600.0,
+                                    step=0.1,
+                                    tooltip=(
+                                        "单个分段的时长上限（秒）。合并完成后，"
+                                        "时长超过该值的分段会按原始时间顺序再切成多段，"
+                                        "每段不超过此值（最后一段为余量）。"
+                                        "按帧边界切分：不丢帧、不重复、顺序不变，"
+                                        "各段首尾相接，帧数与总时长和原分镜一致。"
+                                        "单帧本身（VFR 长帧或容器末帧尾部）长于上限时，"
+                                        "这一帧无法再切，会成为略超上限的 1 帧段。"
+                                        "0 = 不切分；默认关闭。"
                                     ),
                                 ),
                             ],
@@ -1211,6 +1384,14 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
             return "权重文件 '{}' 不存在，请重新选择或放入 models/{}。".format(
                 weights, WEIGHTS_FOLDER
             )
+        max_shot_value = values.get("max_shot_sec", 0.0)
+        if max_shot_value is not None:
+            try:
+                max_shot_sec = float(max_shot_value)
+            except (TypeError, ValueError):
+                return "max_shot_sec 必须是数字。"
+            if max_shot_sec < 0:
+                return "max_shot_sec 不能为负数（0 = 不切分）。"
         return True
 
     @classmethod
@@ -1242,6 +1423,12 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
                 if values.get("merge_max_sec") is None
                 else max(0.0, float(values.get("merge_max_sec")))
             )
+            max_shot_value = values.get("max_shot_sec", 0.0)
+            max_shot_sec = (
+                0.0
+                if max_shot_value is None
+                else max(0.0, float(max_shot_value))
+            )
             segment_sec = None
         else:
             segment_value = values.get("segment_sec", 3.0)
@@ -1255,6 +1442,7 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
             device = "auto"
             drop_transition_frames = False
             merge_max_sec = 0.0
+            max_shot_sec = None
 
         resolved_video_path = _resolve_video_path(video_path)
         if resolved_video_path is not None:
@@ -1347,6 +1535,9 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
                     row["duration"] = row["end_time"] - row["start_time"]
             detected_count = len(rows)
             rows, merge_operations = _merge_shots(rows, merge_max_sec)
+            rows, split_operations = _split_long_shots(
+                rows, max_shot_sec, fps_value, timestamps
+            )
             weights_label = (
                 os.path.basename(weights_path)
                 if weights_path is not None
@@ -1360,6 +1551,7 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
             weights_path = None
             predictions_for_info = None
             merge_operations = 0
+            split_operations = 0
             weights_label = ""
             device_label = ""
             if streaming:
@@ -1454,6 +1646,7 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
             "mode": mode,
             "split_mode": kind,
             "segment_sec": segment_sec,
+            "max_shot_sec": max_shot_sec,
             "video_name": video_name,
             "seed": seed,
         }
@@ -1476,6 +1669,10 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
             "drop_transition_frames": drop_flag,
             "merge_max_sec": round(merge_max_sec, 3),
             "merge_operations": merge_operations,
+            "max_shot_sec": (
+                round(max_shot_sec, 3) if max_shot_sec is not None else None
+            ),
+            "split_operations": split_operations,
             "video_path": resolved_video_path or "",
             "video_name": video_name,
             "seed": seed,
@@ -1494,6 +1691,8 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
                     "end_frame": row["end_frame"],
                     "frame_count": row["frame_count"],
                     "merged_shots": int(row.get("merged_shots", 1)),
+                    "split_part": int(row.get("split_part", 1)),
+                    "split_parts": int(row.get("split_parts", 1)),
                     "start_time": round(row["start_time"], 3),
                     "end_time": round(row["end_time"], 3),
                     "duration": round(row["duration"], 3),
@@ -1515,6 +1714,10 @@ class XiTransNetV2ShotSplitVideo(io.ComfyNode):
                     len(rows), total_frames, fps_value, device_label, threshold
                 )
             )
+            if max_shot_sec:
+                summary += ", max_shot_sec={:g}, split_ops={}".format(
+                    max_shot_sec, split_operations
+                )
         else:
             summary = (
                 "Fixed duration: {} shots, {} frames @ {:.3f} fps, "

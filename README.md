@@ -37,14 +37,14 @@ TransNetV2 的权重已包含在 `transnetv2-pytorch` 里，默认不需要另�
 
 节点的 `分段方式`（`split_mode`）是动态输入，切换后下面的参数会跟着切换：
 
-- `分镜`：用 TransNetV2 检测镜头边界，可调权重、阈值、设备、合并最大时长。
+- `分镜`：用 TransNetV2 检测镜头边界，可调权重、阈值、设备、合并最大时长、最长分段。
 - `时长`：不加载模型，按固定秒数 `segment_sec` 切分，最后不足一段的余量也会保留。
 
 ### 怎么用
 
 1. 接 `media`（`Load Video` 的 VIDEO），或者留空 `media`，在 `video_path` 填本地视频路径。
 2. 选择 `分段方式`：
-   - `分镜`：一般保持 `threshold=0.5`、合并最大时长默认 6 秒即可。
+   - `分镜`：一般保持 `threshold=0.5`、合并最大时长默认 6 秒即可；需要限制单段长度时把 `max_shot_sec` 设为上限秒数（例如 5），超过 5 秒的分镜会再被切开。
    - `时长`：填 `segment_sec`，例如 3 表示每 3 秒一段。
 3. 后面接 `Save Video` 就能一次导出全部分段；列表输出会让下游对每段各执行一次。
 
@@ -78,6 +78,7 @@ XiTransNetV2ShotSplitVideo
 | `device` | auto | `auto` 优先 CUDA，否则 CPU；MPS 需显式选择 |
 | `drop_transition_frames` | 关 | 关：转场帧作为上一段的尾帧，所有帧保留；开：丢弃转场帧，可能每段少 1–N 帧 |
 | `merge_max_sec` | 6.0 | 合并后的最大时长；相邻段连续合并，累计不超过此值；单段自身超过此值不参与合并；0 = 不合并 |
+| `max_shot_sec` | 0（关闭） | 单个分段的时长上限（秒）。合并完成后，超过该值的分段会再切成多段，每段不超过此值（按帧边界；单帧本身长于上限时无法再切）；0 = 不切分 |
 
 ### 时长模式参数
 
@@ -90,7 +91,7 @@ XiTransNetV2ShotSplitVideo
 - 例：10 秒视频、`segment_sec=3`，得到 3 + 3 + 3 + 1 秒四段。
 - 不加载 TransNetV2，也不做合并；文件输入是 VFR 时按真实时间戳切，不按平均帧率估算。
 
-从旧版升级时，`分段方式` 是新增的动态输入，旧工作流里平铺的 `weights`/`threshold` 等参数不会自动迁移；如果保存过旧的 `transnetv2`/`duration` 值，重新添加节点并选一次 `分镜`/`时长` 即可。`merge_short_sec` 已移除，现在只保留 `merge_max_sec`。
+从旧版升级时，`分段方式` 是新增的动态输入，旧工作流里平铺的 `weights`/`threshold` 等参数不会自动迁移；如果保存过旧的 `transnetv2`/`duration` 值，重新添加节点并选一次 `分镜`/`时长` 即可。`merge_short_sec` 已移除，现在只保留 `merge_max_sec`。`max_shot_sec` 是新增参数，默认 `0`（关闭），旧工作流不填时不会切分，行为不变。
 
 ### 重复处理同一个视频
 
@@ -106,6 +107,7 @@ ComfyUI 会用输入值做缓存键。`seed` 虽然是元数据、不会改变�
 
 - `分镜` 默认切点帧属于**上一段**，是上一段的最后一帧；下一段从切点之后开始，所以相邻段首尾相接、不丢帧。
 - 开启 `drop_transition_frames` 才会丢切点帧，得到的是官方 `predictions_to_scenes` 那种有间隔的分段。
+- `max_shot_sec` 切出的片段同样首尾相接：后一片从上一片的下一帧开始，帧序号连续，顺序不变。
 - `时长` 模式同样首尾相接：上一段的结束时间就是下一段的开始时间。
 
 ### 合并规则（仅分镜模式）
@@ -116,13 +118,25 @@ ComfyUI 会用输入值做缓存键。`seed` 虽然是元数据、不会改变�
 - `0` = 完全不做合并；合并只发生在帧号连续的段之间，不删帧。
 - 例：7 个 1 秒段、上限 6 秒 → 6 秒 + 1 秒；5 个 2 秒段 → 6 秒 + 4 秒；3 个 3 秒段 → 6 秒 + 3 秒；2/8/2 秒、上限 6 秒 → 2/8/2 秒（8 秒段不参与合并）。
 
+### 切割超长分镜（仅分镜模式）
+
+- `max_shot_sec` 在**合并之后**执行：先按 `merge_max_sec` 合并，再把仍超过 `max_shot_sec` 的分段切开。
+- 切法是「尽量装满」：前几段都接近但不超过上限，最后一段是余量。例：12 秒分镜、`max_shot_sec=5` → 5 + 5 + 2 秒。
+- 只按帧边界切：不丢帧、不重复，切开的片段保持原视频顺序，各段首尾相接。
+- 上限按帧边界保证。如果**单帧本身**就长于上限（VFR 的长帧，或容器末帧的尾部时长），这一帧无法再切，会单独成为一段略超上限的 1 帧视频；这是帧粒度的固有极限。
+- 帧数与时长守恒：切开后所有片段的 `frame_count` 之和等于原分镜，`duration` 之和也等于原分镜（浮点误差内）。视频末尾多出来的那点容器时长（末帧之后的余量）会作为最后一段保留。
+- 切开后的片段 `merged_shots` 继承父分镜（合并组的镜头无法精确摊到各个切片上）。
+- 切点不是模型检测出的镜头边界，所以只有每个分镜的第一片保留原 `boundary_score`，后续片段的 `boundary_score` 为空。
+- `videos` 顺序即输出顺序：先按原分镜顺序，再按片段顺序，接 `Save Video` 得到的 `shot_00001_.mp4`、`shot_00002_.mp4`……就是原视频时间顺序。
+- `0` = 不切分；默认关闭，旧工作流行为不变。切分只发生在分镜模式，时长模式本来就能直接设 `segment_sec`。
+
 ### 输出
 
 | 输出 | 说明 |
 | --- | --- |
 | `videos` | VIDEO 列表，每个输出分段一个视频，带原视频音频 |
-| `shot_info` | JSON：`split_mode`、`segment_sec`、帧率、总帧数、分段起止帧/时间、`video_name`、`seed`、`detected_shots`、`merged_shots`、CSV 路径等 |
-| `shot_count` | 合并后的实际分段数（时长模式就是固定切分的段数） |
+| `shot_info` | JSON：`split_mode`、`segment_sec`、`max_shot_sec`、`split_operations`（新增段数，切 3 片记 2）、帧率、总帧数、分段起止帧/时间、`video_name`、`seed`、`detected_shots`、`merged_shots`、CSV 路径等 |
+| `shot_count` | 最终实际分段数（合并 + 切分后的段数；时长模式就是固定切分的段数） |
 | `video_name` | 加载视频的文件名，不含扩展名；无文件路径的输入为空字符串 |
 
 `videos` 是列表输出：接一个 `Save Video`，会生成 `shot_00001_.mp4`、`shot_00002_.mp4`……
@@ -141,9 +155,9 @@ ComfyUI 会用输入值做缓存键。`seed` 虽然是元数据、不会改变�
 
 `output_csv` 开启后写入 `output/transnetv2/shots_XXXXX_.csv`（UTF-8 BOM）。
 
-列：`shot_id, start_frame, end_frame, frame_count, start_time, end_time, duration_sec, boundary_score, fps, threshold, total_frames, source, weights, device, merged_shots, video_name, seed, split_mode, segment_sec`
+列：`shot_id, start_frame, end_frame, frame_count, start_time, end_time, duration_sec, boundary_score, fps, threshold, total_frames, source, weights, device, merged_shots, video_name, seed, split_mode, segment_sec, max_shot_sec, split_part, split_parts`
 
-`end_frame` 为闭区间；`merged_shots` 表示该段由几个原始镜头合并而成；`video_name` / `seed` 原样记录本次输入和运行标识。`split_mode` 记录内部值 `transnetv2` 或 `duration`（界面显示为 `分镜`/`时长`）；`时长` 模式下 `threshold`、`weights`、`device`、`boundary_score` 留空，`segment_sec` 记录实际使用的分段时长。
+`end_frame` 为闭区间；`merged_shots` 表示该段由几个原始镜头合并而成；`split_part` / `split_parts` 表示该段是某个分镜切开后的第几片、一共几片（未切分为 1/1）；`video_name` / `seed` 原样记录本次输入和运行标识。`split_mode` 记录内部值 `transnetv2` 或 `duration`（界面显示为 `分镜`/`时长`）；`时长` 模式下 `threshold`、`weights`、`device`、`boundary_score`、`max_shot_sec` 留空，`segment_sec` 记录实际使用的分段时长。
 
 ## 其他节点
 
